@@ -10,12 +10,13 @@ import chess
 import torch
 import torch.nn as nn
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 
 # ============================================================
 # NYRA CHESS API 0.2
-# NyraNet + Minimax (Negamax) + Alpha-Beta
+# NyraNet + Negamax + Alpha-Beta
 # CPU inference + private Hugging Face checkpoint
 # ============================================================
 
@@ -28,12 +29,23 @@ DEVICE = torch.device("cpu")
 torch.set_num_threads(1)
 
 SEARCH_DEPTH = max(1, min(4, int(os.getenv("SEARCH_DEPTH", "2"))))
-MAX_SEARCH_NODES = max(50, min(5000, int(os.getenv("MAX_SEARCH_NODES", "250"))))
+MAX_SEARCH_NODES = max(
+    50, min(5000, int(os.getenv("MAX_SEARCH_NODES", "250")))
+)
 SEARCH_TIME_LIMIT = max(
     0.25, min(15.0, float(os.getenv("SEARCH_TIME_LIMIT", "3.0")))
 )
 
 app = FastAPI(title=SERVICE_NAME, version="0.2.0")
+
+# CORS: allow the GitHub Pages frontend to call Render.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["https://uyen11a1-star.github.io"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type"],
+)
 
 model = None
 model_loaded = False
@@ -56,13 +68,11 @@ MATE_SCORE = 100_000
 
 # ============================================================
 # MODEL ARCHITECTURE
-# Matches checkpoint keys: blocks.*.net.* and policy.*
 # ============================================================
 
 class ResidualBlock(nn.Module):
     def __init__(self, channels: int = 64):
         super().__init__()
-
         self.net = nn.Sequential(
             nn.Conv2d(channels, channels, 3, padding=1, bias=False),
             nn.BatchNorm2d(channels),
@@ -70,7 +80,6 @@ class ResidualBlock(nn.Module):
             nn.Conv2d(channels, channels, 3, padding=1, bias=False),
             nn.BatchNorm2d(channels),
         )
-
         self.relu = nn.ReLU(inplace=True)
 
     def forward(self, x):
@@ -80,17 +89,14 @@ class ResidualBlock(nn.Module):
 class NyraNet(nn.Module):
     def __init__(self):
         super().__init__()
-
         self.stem = nn.Sequential(
             nn.Conv2d(18, 64, 3, padding=1, bias=False),
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
         )
-
         self.blocks = nn.ModuleList([
             ResidualBlock(64) for _ in range(4)
         ])
-
         self.policy = nn.Sequential(
             nn.Conv2d(64, 2, 1),
             nn.ReLU(inplace=True),
@@ -100,15 +106,13 @@ class NyraNet(nn.Module):
 
     def forward(self, x):
         x = self.stem(x)
-
         for block in self.blocks:
             x = block(x)
-
         return self.policy(x)
 
 
 # ============================================================
-# CHECKPOINT DOWNLOAD
+# DOWNLOAD PRIVATE HUGGING FACE CHECKPOINT
 # ============================================================
 
 def download_checkpoint():
@@ -141,7 +145,9 @@ def download_checkpoint():
             response.raise_for_status()
 
             with open(temp_path, "wb") as output:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                for chunk in response.iter_content(
+                    chunk_size=1024 * 1024
+                ):
                     if chunk:
                         output.write(chunk)
 
@@ -149,7 +155,9 @@ def download_checkpoint():
             raise RuntimeError("Downloaded checkpoint is empty.")
 
         temp_path.replace(MODEL_PATH)
-        print(f"Checkpoint downloaded: {MODEL_PATH.stat().st_size} bytes")
+        print(
+            f"Checkpoint downloaded: {MODEL_PATH.stat().st_size} bytes"
+        )
 
     except Exception:
         temp_path.unlink(missing_ok=True)
@@ -157,7 +165,7 @@ def download_checkpoint():
 
 
 # ============================================================
-# LOAD CHECKPOINT
+# LOAD MODEL
 # ============================================================
 
 def extract_state_dict(checkpoint):
@@ -291,7 +299,11 @@ def encode_board(board: chess.Board) -> torch.Tensor:
 
     for square, piece in board.piece_map().items():
         plane = PIECE_TO_PLANE[(piece.color, piece.piece_type)]
-        planes[plane, chess.square_rank(square), chess.square_file(square)] = 1.0
+        planes[
+            plane,
+            chess.square_rank(square),
+            chess.square_file(square),
+        ] = 1.0
 
     if board.turn == chess.WHITE:
         planes[12, :, :] = 1.0
@@ -323,8 +335,6 @@ def encode_board(board: chess.Board) -> torch.Tensor:
 # ============================================================
 
 def evaluate_board(board: chess.Board) -> int:
-    """Evaluate material and simple positional factors for side to move."""
-
     if board.is_checkmate():
         return -MATE_SCORE
 
@@ -358,7 +368,6 @@ def evaluate_board(board: chess.Board) -> int:
 
         score += value if piece.color == chess.WHITE else -value
 
-    # Penalize the side to move slightly if its king is in check.
     if board.is_check():
         score -= 20
 
@@ -371,14 +380,11 @@ def evaluate_board(board: chess.Board) -> int:
 
 def get_policy_logits(board: chess.Board, current_model):
     x = encode_board(board).to(DEVICE)
-
     with torch.inference_mode():
         return current_model(x)[0]
 
 
 def order_moves(board: chess.Board, moves, logits):
-    """Order moves using NyraNet policy, captures and promotions."""
-
     ranked = []
 
     for move in moves:
@@ -405,7 +411,6 @@ def order_moves(board: chess.Board, moves, logits):
 
             score += 10_000 + victim_value * 10 - attacker_value
 
-        # Give checking moves a small ordering bonus.
         board.push(move)
         if board.is_check():
             score += 100
@@ -418,7 +423,7 @@ def order_moves(board: chess.Board, moves, logits):
 
 
 # ============================================================
-# MINIMAX / NEGAMAX + ALPHA-BETA
+# NEGAMAX + ALPHA-BETA SEARCH
 # ============================================================
 
 def negamax(board, current_model, depth, alpha, beta, state):
@@ -446,7 +451,6 @@ def negamax(board, current_model, depth, alpha, beta, state):
         return evaluate_board(board)
 
     moves = list(board.legal_moves)
-
     if not moves:
         return evaluate_board(board)
 
@@ -481,10 +485,7 @@ def negamax(board, current_model, depth, alpha, beta, state):
         best_score = max(best_score, score)
         alpha = max(alpha, score)
 
-        if alpha >= beta:
-            break
-
-        if state["aborted"]:
+        if alpha >= beta or state["aborted"]:
             break
 
     if best_score == -float("inf"):
@@ -525,14 +526,12 @@ def search_best_move(board: chess.Board, current_model, allowed_moves=None):
         "aborted": False,
     }
 
-    # Safe fallback: if search reaches its limit, still return a legal move.
     root_logits = get_policy_logits(board, current_model)
     ordered_root = order_moves(board, legal_moves, root_logits)
     best_move = ordered_root[0]
     best_score = -float("inf")
     completed_depth = 0
 
-    # Iterative deepening: preserve only completed iterations.
     for depth in range(1, SEARCH_DEPTH + 1):
         if (
             state["nodes"] >= state["max_nodes"]
@@ -602,7 +601,7 @@ def search_best_move(board: chess.Board, current_model, allowed_moves=None):
 
 
 # ============================================================
-# API SCHEMAS
+# REQUEST SCHEMA
 # ============================================================
 
 class MoveRequest(BaseModel):
@@ -611,7 +610,7 @@ class MoveRequest(BaseModel):
 
 
 # ============================================================
-# ENDPOINTS
+# API ENDPOINTS
 # ============================================================
 
 @app.get("/")
@@ -775,7 +774,6 @@ def debug_predict(fen: str):
             logits = current_model(x)[0]
 
         values, indices = torch.topk(logits, k=10)
-
         predictions = []
 
         for score, index in zip(values.tolist(), indices.tolist()):
