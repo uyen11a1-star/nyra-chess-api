@@ -474,3 +474,59 @@ def choose_move(request: MoveRequest):
             status_code=500,
             detail=f"Move inference failed: {type(exc).__name__}: {exc}",
         )
+        
+@app.get("/debug/predict")
+def debug_predict(fen: str):
+    with model_lock:
+        current_model = model
+        ready = model_loaded
+
+    if not ready or current_model is None:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "model_loaded": ready,
+                "model_error": model_error,
+            },
+        )
+
+    try:
+        board = chess.Board(fen)
+
+        if not board.is_valid():
+            raise HTTPException(status_code=400, detail="Invalid FEN")
+
+        x = encode_board(board).to(DEVICE)
+
+        with torch.inference_mode():
+            logits = current_model(x)[0]
+
+        # Lấy 10 dự đoán có điểm cao nhất từ chính model.
+        values, indices = torch.topk(logits, k=10)
+
+        predictions = []
+        for score, index in zip(values.tolist(), indices.tolist()):
+            from_sq = index // 64
+            to_sq = index % 64
+            move = chess.Move(from_sq, to_sq)
+
+            predictions.append({
+                "uci": move.uci(),
+                "score": round(float(score), 5),
+                "is_legal": move in board.legal_moves,
+            })
+
+        return {
+            "model_loaded": True,
+            "prediction_source": "NyraNet raw logits",
+            "top_predictions": predictions,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"{type(exc).__name__}: {exc}",
+        )
+
