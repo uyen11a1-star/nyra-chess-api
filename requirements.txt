@@ -1,5 +1,7 @@
+ --extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.6.0
 fastapi
 uvicorn
-torch
+requests
 python-chess
 numpy
