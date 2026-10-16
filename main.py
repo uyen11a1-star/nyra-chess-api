@@ -2,7 +2,6 @@
 import os
 import time
 import threading
-import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -11,25 +10,30 @@ import chess
 import torch
 import torch.nn as nn
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 # ============================================================
-# NYRA CHESS API
-# CPU inference + Hugging Face private checkpoint
+# NYRA CHESS API 0.2
+# NyraNet + Minimax (Negamax) + Alpha-Beta
+# CPU inference + private Hugging Face checkpoint
 # ============================================================
 
 SERVICE_NAME = "Nyra Chess API"
 MODEL_URL = os.getenv("MODEL_URL", "").strip()
 HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
-MODEL_PATH = Path(
-    os.getenv("MODEL_PATH", "/tmp/nyra_chess_best.pt")
-)
+MODEL_PATH = Path(os.getenv("MODEL_PATH", "/tmp/nyra_chess_best.pt"))
 
 DEVICE = torch.device("cpu")
 torch.set_num_threads(1)
 
-app = FastAPI(title=SERVICE_NAME, version="1.0.0")
+SEARCH_DEPTH = max(1, min(4, int(os.getenv("SEARCH_DEPTH", "2"))))
+MAX_SEARCH_NODES = max(50, min(5000, int(os.getenv("MAX_SEARCH_NODES", "250"))))
+SEARCH_TIME_LIMIT = max(
+    0.25, min(15.0, float(os.getenv("SEARCH_TIME_LIMIT", "3.0")))
+)
+
+app = FastAPI(title=SERVICE_NAME, version="0.2.0")
 
 model = None
 model_loaded = False
@@ -37,6 +41,17 @@ model_error = None
 model_status = "loading"
 model_lock = threading.Lock()
 load_started = False
+
+PIECE_VALUES = {
+    chess.PAWN: 100,
+    chess.KNIGHT: 320,
+    chess.BISHOP: 335,
+    chess.ROOK: 500,
+    chess.QUEEN: 900,
+    chess.KING: 0,
+}
+
+MATE_SCORE = 100_000
 
 
 # ============================================================
@@ -49,16 +64,10 @@ class ResidualBlock(nn.Module):
         super().__init__()
 
         self.net = nn.Sequential(
-            nn.Conv2d(
-                channels, channels,
-                kernel_size=3, padding=1, bias=False
-            ),
+            nn.Conv2d(channels, channels, 3, padding=1, bias=False),
             nn.BatchNorm2d(channels),
             nn.ReLU(inplace=True),
-            nn.Conv2d(
-                channels, channels,
-                kernel_size=3, padding=1, bias=False
-            ),
+            nn.Conv2d(channels, channels, 3, padding=1, bias=False),
             nn.BatchNorm2d(channels),
         )
 
@@ -73,10 +82,7 @@ class NyraNet(nn.Module):
         super().__init__()
 
         self.stem = nn.Sequential(
-            nn.Conv2d(
-                18, 64, kernel_size=3,
-                padding=1, bias=False
-            ),
+            nn.Conv2d(18, 64, 3, padding=1, bias=False),
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
         )
@@ -86,7 +92,7 @@ class NyraNet(nn.Module):
         ])
 
         self.policy = nn.Sequential(
-            nn.Conv2d(64, 2, kernel_size=1),
+            nn.Conv2d(64, 2, 1),
             nn.ReLU(inplace=True),
             nn.Flatten(),
             nn.Linear(128, 4096),
@@ -120,7 +126,6 @@ def download_checkpoint():
         headers["Authorization"] = f"Bearer {HF_TOKEN}"
 
     MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
-
     temp_path = MODEL_PATH.with_suffix(".download")
 
     try:
@@ -136,9 +141,7 @@ def download_checkpoint():
             response.raise_for_status()
 
             with open(temp_path, "wb") as output:
-                for chunk in response.iter_content(
-                    chunk_size=1024 * 1024
-                ):
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
                     if chunk:
                         output.write(chunk)
 
@@ -146,14 +149,10 @@ def download_checkpoint():
             raise RuntimeError("Downloaded checkpoint is empty.")
 
         temp_path.replace(MODEL_PATH)
-        print(
-            f"Checkpoint downloaded: "
-            f"{MODEL_PATH.stat().st_size} bytes"
-        )
+        print(f"Checkpoint downloaded: {MODEL_PATH.stat().st_size} bytes")
 
     except Exception:
-        if temp_path.exists():
-            temp_path.unlink(missing_ok=True)
+        temp_path.unlink(missing_ok=True)
         raise
 
 
@@ -170,7 +169,6 @@ def extract_state_dict(checkpoint):
         if isinstance(candidate, dict):
             return candidate
 
-    # A raw state_dict contains parameter tensors directly.
     if checkpoint and all(
         isinstance(value, torch.Tensor)
         for value in checkpoint.values()
@@ -192,8 +190,8 @@ def load_model():
 
     try:
         download_checkpoint()
-
         print("Reading checkpoint on CPU...")
+
         try:
             checkpoint = torch.load(
                 MODEL_PATH,
@@ -201,7 +199,6 @@ def load_model():
                 weights_only=True,
             )
         except TypeError:
-            # Compatibility fallback for older PyTorch versions.
             checkpoint = torch.load(
                 MODEL_PATH,
                 map_location="cpu",
@@ -209,10 +206,8 @@ def load_model():
 
         state_dict = extract_state_dict(checkpoint)
 
-        # Handle checkpoints saved through DataParallel.
         if state_dict and all(
-            key.startswith("module.")
-            for key in state_dict
+            key.startswith("module.") for key in state_dict
         ):
             state_dict = {
                 key[len("module."):]: value
@@ -220,20 +215,17 @@ def load_model():
             }
 
         candidate = NyraNet().to(DEVICE)
-
-        # Strict loading: do not silently ignore missing weights.
         candidate.load_state_dict(state_dict, strict=True)
         candidate.eval()
 
-        # Confirm the policy head produces 4096 move classes.
         with torch.inference_mode():
-            test_input = torch.zeros(1, 18, 8, 8, device=DEVICE)
-            test_output = candidate(test_input)
+            output = candidate(
+                torch.zeros(1, 18, 8, 8, device=DEVICE)
+            )
 
-        if tuple(test_output.shape) != (1, 4096):
+        if tuple(output.shape) != (1, 4096):
             raise RuntimeError(
-                f"Unexpected model output shape: "
-                f"{tuple(test_output.shape)}"
+                f"Unexpected model output shape: {tuple(output.shape)}"
             )
 
         with model_lock:
@@ -262,12 +254,11 @@ def start_model_loading():
             return
         load_started = True
 
-    thread = threading.Thread(
+    threading.Thread(
         target=load_model,
         daemon=True,
         name="nyra-model-loader",
-    )
-    thread.start()
+    ).start()
 
 
 @app.on_event("startup")
@@ -277,10 +268,6 @@ def startup_event():
 
 # ============================================================
 # BOARD ENCODING: 18 PLANES
-# 0-5 white pieces, 6-11 black pieces
-# 12 side to move
-# 13-16 castling rights
-# 17 en-passant square
 # ============================================================
 
 PIECE_TO_PLANE = {
@@ -304,9 +291,7 @@ def encode_board(board: chess.Board) -> torch.Tensor:
 
     for square, piece in board.piece_map().items():
         plane = PIECE_TO_PLANE[(piece.color, piece.piece_type)]
-        rank = chess.square_rank(square)
-        file = chess.square_file(square)
-        planes[plane, rank, file] = 1.0
+        planes[plane, chess.square_rank(square), chess.square_file(square)] = 1.0
 
     if board.turn == chess.WHITE:
         planes[12, :, :] = 1.0
@@ -324,11 +309,296 @@ def encode_board(board: chess.Board) -> torch.Tensor:
         planes[16, :, :] = 1.0
 
     if board.ep_square is not None:
-        rank = chess.square_rank(board.ep_square)
-        file = chess.square_file(board.ep_square)
-        planes[17, rank, file] = 1.0
+        planes[
+            17,
+            chess.square_rank(board.ep_square),
+            chess.square_file(board.ep_square),
+        ] = 1.0
 
     return planes.unsqueeze(0)
+
+
+# ============================================================
+# POSITION EVALUATION
+# ============================================================
+
+def evaluate_board(board: chess.Board) -> int:
+    """Evaluate material and simple positional factors for side to move."""
+
+    if board.is_checkmate():
+        return -MATE_SCORE
+
+    if (
+        board.is_stalemate()
+        or board.is_insufficient_material()
+        or board.is_fifty_moves()
+        or board.is_repetition(3)
+    ):
+        return 0
+
+    score = 0
+
+    for square, piece in board.piece_map().items():
+        value = PIECE_VALUES[piece.piece_type]
+        file_idx = chess.square_file(square)
+        rank_idx = chess.square_rank(square)
+
+        relative_rank = (
+            rank_idx if piece.color == chess.WHITE else 7 - rank_idx
+        )
+
+        if piece.piece_type == chess.PAWN:
+            value += relative_rank * 5
+
+        elif piece.piece_type in (chess.KNIGHT, chess.BISHOP):
+            center_distance = (
+                abs(3.5 - file_idx) + abs(3.5 - rank_idx)
+            )
+            value += int(12 - 3 * center_distance)
+
+        score += value if piece.color == chess.WHITE else -value
+
+    # Penalize the side to move slightly if its king is in check.
+    if board.is_check():
+        score -= 20
+
+    return score if board.turn == chess.WHITE else -score
+
+
+# ============================================================
+# NYRANET POLICY + MOVE ORDERING
+# ============================================================
+
+def get_policy_logits(board: chess.Board, current_model):
+    x = encode_board(board).to(DEVICE)
+
+    with torch.inference_mode():
+        return current_model(x)[0]
+
+
+def order_moves(board: chess.Board, moves, logits):
+    """Order moves using NyraNet policy, captures and promotions."""
+
+    ranked = []
+
+    for move in moves:
+        index = move.from_square * 64 + move.to_square
+        score = float(logits[index].item())
+
+        if move.promotion:
+            score += 5000 + PIECE_VALUES.get(move.promotion, 0)
+
+        if board.is_capture(move):
+            victim = board.piece_at(move.to_square)
+
+            if victim is None and board.is_en_passant(move):
+                victim_value = PIECE_VALUES[chess.PAWN]
+            else:
+                victim_value = (
+                    PIECE_VALUES[victim.piece_type] if victim else 0
+                )
+
+            attacker = board.piece_at(move.from_square)
+            attacker_value = (
+                PIECE_VALUES[attacker.piece_type] if attacker else 0
+            )
+
+            score += 10_000 + victim_value * 10 - attacker_value
+
+        # Give checking moves a small ordering bonus.
+        board.push(move)
+        if board.is_check():
+            score += 100
+        board.pop()
+
+        ranked.append((score, move))
+
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    return [move for _, move in ranked]
+
+
+# ============================================================
+# MINIMAX / NEGAMAX + ALPHA-BETA
+# ============================================================
+
+def negamax(board, current_model, depth, alpha, beta, state):
+    state["nodes"] += 1
+
+    if board.is_checkmate():
+        return -MATE_SCORE + state["ply"]
+
+    if (
+        board.is_stalemate()
+        or board.is_insufficient_material()
+        or board.is_fifty_moves()
+        or board.is_repetition(3)
+    ):
+        return 0
+
+    if depth <= 0:
+        return evaluate_board(board)
+
+    if (
+        state["nodes"] >= state["max_nodes"]
+        or time.monotonic() >= state["deadline"]
+    ):
+        state["aborted"] = True
+        return evaluate_board(board)
+
+    moves = list(board.legal_moves)
+
+    if not moves:
+        return evaluate_board(board)
+
+    logits = get_policy_logits(board, current_model)
+    moves = order_moves(board, moves, logits)
+
+    best_score = -float("inf")
+
+    for move in moves:
+        if (
+            state["nodes"] >= state["max_nodes"]
+            or time.monotonic() >= state["deadline"]
+        ):
+            state["aborted"] = True
+            break
+
+        board.push(move)
+        state["ply"] += 1
+
+        score = -negamax(
+            board,
+            current_model,
+            depth - 1,
+            -beta,
+            -alpha,
+            state,
+        )
+
+        state["ply"] -= 1
+        board.pop()
+
+        best_score = max(best_score, score)
+        alpha = max(alpha, score)
+
+        if alpha >= beta:
+            break
+
+        if state["aborted"]:
+            break
+
+    if best_score == -float("inf"):
+        return evaluate_board(board)
+
+    return best_score
+
+
+def search_best_move(board: chess.Board, current_model, allowed_moves=None):
+    legal_moves = list(board.legal_moves)
+
+    if allowed_moves is not None:
+        allowed_uci = {move.uci() for move in allowed_moves}
+        legal_moves = [
+            move for move in legal_moves if move.uci() in allowed_uci
+        ]
+
+    if not legal_moves:
+        raise ValueError("No legal moves available for search.")
+
+    if len(legal_moves) == 1:
+        return legal_moves[0], {
+            "depth": 0,
+            "requested_depth": SEARCH_DEPTH,
+            "nodes": 0,
+            "elapsed_ms": 0,
+            "aborted": False,
+            "method": "forced_move",
+        }
+
+    started = time.monotonic()
+
+    state = {
+        "nodes": 0,
+        "max_nodes": MAX_SEARCH_NODES,
+        "deadline": started + SEARCH_TIME_LIMIT,
+        "ply": 0,
+        "aborted": False,
+    }
+
+    # Safe fallback: if search reaches its limit, still return a legal move.
+    root_logits = get_policy_logits(board, current_model)
+    ordered_root = order_moves(board, legal_moves, root_logits)
+    best_move = ordered_root[0]
+    best_score = -float("inf")
+    completed_depth = 0
+
+    # Iterative deepening: preserve only completed iterations.
+    for depth in range(1, SEARCH_DEPTH + 1):
+        if (
+            state["nodes"] >= state["max_nodes"]
+            or time.monotonic() >= state["deadline"]
+        ):
+            state["aborted"] = True
+            break
+
+        iteration_move = None
+        iteration_score = -float("inf")
+        alpha = -float("inf")
+        beta = float("inf")
+        interrupted = False
+
+        for move in ordered_root:
+            if (
+                state["nodes"] >= state["max_nodes"]
+                or time.monotonic() >= state["deadline"]
+            ):
+                state["aborted"] = True
+                interrupted = True
+                break
+
+            board.push(move)
+            state["ply"] = 1
+
+            score = -negamax(
+                board,
+                current_model,
+                depth - 1,
+                -beta,
+                -alpha,
+                state,
+            )
+
+            board.pop()
+            state["ply"] = 0
+
+            if score > iteration_score:
+                iteration_score = score
+                iteration_move = move
+
+            alpha = max(alpha, score)
+
+            if state["aborted"]:
+                interrupted = True
+                break
+
+        if iteration_move is not None and not interrupted:
+            best_move = iteration_move
+            best_score = iteration_score
+            completed_depth = depth
+        else:
+            break
+
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+
+    return best_move, {
+        "depth": completed_depth,
+        "requested_depth": SEARCH_DEPTH,
+        "nodes": state["nodes"],
+        "elapsed_ms": elapsed_ms,
+        "aborted": state["aborted"],
+        "score": None if best_score == -float("inf") else int(best_score),
+        "method": "NyraNet + Negamax/Alpha-Beta",
+    }
 
 
 # ============================================================
@@ -337,7 +607,7 @@ def encode_board(board: chess.Board) -> torch.Tensor:
 
 class MoveRequest(BaseModel):
     fen: str
-    legal_moves: list[Any] = []
+    legal_moves: list[Any] = Field(default_factory=list)
 
 
 # ============================================================
@@ -348,8 +618,15 @@ class MoveRequest(BaseModel):
 def root():
     return {
         "service": SERVICE_NAME,
+        "version": "0.2.0",
         "health": "/health",
         "move": "/move",
+        "debug_predict": "/debug/predict?fen=<fen>",
+        "search": {
+            "depth": SEARCH_DEPTH,
+            "max_nodes": MAX_SEARCH_NODES,
+            "time_limit_seconds": SEARCH_TIME_LIMIT,
+        },
     }
 
 
@@ -363,19 +640,57 @@ def health():
         }
 
 
+def parse_supplied_legal_moves(board: chess.Board, supplied):
+    if not supplied:
+        return None
+
+    allowed = set()
+
+    for item in supplied:
+        if isinstance(item, str):
+            raw_uci = item
+        elif isinstance(item, dict):
+            raw_uci = item.get("uci")
+        else:
+            continue
+
+        if not isinstance(raw_uci, str) or not raw_uci:
+            continue
+
+        try:
+            move = chess.Move.from_uci(raw_uci)
+            if move in board.legal_moves:
+                allowed.add(move.uci())
+        except (ValueError, TypeError):
+            continue
+
+    if not allowed:
+        raise HTTPException(
+            status_code=400,
+            detail="No valid legal_moves were supplied.",
+        )
+
+    return [
+        move for move in board.legal_moves
+        if move.uci() in allowed
+    ]
+
+
 @app.post("/move")
 def choose_move(request: MoveRequest):
     with model_lock:
         current_model = model
         ready = model_loaded
+        current_status = model_status
+        current_error = model_error
 
     if not ready or current_model is None:
         raise HTTPException(
             status_code=503,
             detail={
                 "error": "Model is not ready",
-                "model_status": model_status,
-                "model_error": model_error,
+                "model_status": current_status,
+                "model_error": current_error,
             },
         )
 
@@ -393,77 +708,27 @@ def choose_move(request: MoveRequest):
             detail="Invalid chess position.",
         )
 
-    legal_moves = list(board.legal_moves)
-
-    if not legal_moves:
+    if board.is_game_over(claim_draw=True):
         raise HTTPException(
             status_code=400,
-            detail="No legal moves in this position.",
+            detail="The game is already over.",
         )
 
-    # Use legal moves supplied by the frontend when available.
-    # Every move is validated against the actual board.
-    if request.legal_moves:
-        allowed_uci = set()
-
-        for item in request.legal_moves:
-            if isinstance(item, str):
-                raw_uci = item
-            elif isinstance(item, dict):
-                raw_uci = item.get("uci")
-            else:
-                continue
-
-            if not raw_uci:
-                continue
-
-            try:
-                candidate_move = chess.Move.from_uci(raw_uci)
-                if candidate_move in board.legal_moves:
-                    allowed_uci.add(candidate_move.uci())
-            except (ValueError, TypeError):
-                continue
-
-        legal_moves = [
-            move for move in legal_moves
-            if move.uci() in allowed_uci
-        ]
-
-        if not legal_moves:
-            raise HTTPException(
-                status_code=400,
-                detail="No valid legal_moves were supplied.",
-            )
-
     try:
-        input_tensor = encode_board(board).to(DEVICE)
+        allowed_moves = parse_supplied_legal_moves(
+            board, request.legal_moves
+        )
 
-        with torch.inference_mode():
-            logits = current_model(input_tensor)[0]
-
-        # Map each move to from_square * 64 + to_square.
-        # Promotions share the same policy index, so prefer queen
-        # promotion when multiple promotions have the same score.
-        ranked_moves = []
-
-        for move in legal_moves:
-            move_index = move.from_square * 64 + move.to_square
-            score = float(logits[move_index].item())
-
-            promotion_bonus = (
-                1e-6 if move.promotion == chess.QUEEN else 0.0
-            )
-
-            ranked_moves.append(
-                (score + promotion_bonus, move)
-            )
-
-        ranked_moves.sort(key=lambda item: item[0], reverse=True)
-        best_move = ranked_moves[0][1]
+        best_move, search_info = search_best_move(
+            board,
+            current_model,
+            allowed_moves=allowed_moves,
+        )
 
         return {
             "uci": best_move.uci(),
             "san": board.san(best_move),
+            "search": search_info,
         }
 
     except HTTPException:
@@ -472,21 +737,26 @@ def choose_move(request: MoveRequest):
         print(f"MOVE ERROR: {type(exc).__name__}: {exc}")
         raise HTTPException(
             status_code=500,
-            detail=f"Move inference failed: {type(exc).__name__}: {exc}",
+            detail=(
+                f"Move search failed: "
+                f"{type(exc).__name__}: {exc}"
+            ),
         )
-        
+
+
 @app.get("/debug/predict")
 def debug_predict(fen: str):
     with model_lock:
         current_model = model
         ready = model_loaded
+        current_error = model_error
 
     if not ready or current_model is None:
         raise HTTPException(
             status_code=503,
             detail={
                 "model_loaded": ready,
-                "model_error": model_error,
+                "model_error": current_error,
             },
         )
 
@@ -494,17 +764,20 @@ def debug_predict(fen: str):
         board = chess.Board(fen)
 
         if not board.is_valid():
-            raise HTTPException(status_code=400, detail="Invalid FEN")
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid FEN",
+            )
 
         x = encode_board(board).to(DEVICE)
 
         with torch.inference_mode():
             logits = current_model(x)[0]
 
-        # Lấy 10 dự đoán có điểm cao nhất từ chính model.
         values, indices = torch.topk(logits, k=10)
 
         predictions = []
+
         for score, index in zip(values.tolist(), indices.tolist()):
             from_sq = index // 64
             to_sq = index % 64
@@ -516,10 +789,35 @@ def debug_predict(fen: str):
                 "is_legal": move in board.legal_moves,
             })
 
+        legal_ranked = sorted(
+            board.legal_moves,
+            key=lambda move: float(
+                logits[
+                    move.from_square * 64 + move.to_square
+                ].item()
+            ),
+            reverse=True,
+        )[:10]
+
         return {
             "model_loaded": True,
             "prediction_source": "NyraNet raw logits",
             "top_predictions": predictions,
+            "top_legal_predictions": [
+                {
+                    "uci": move.uci(),
+                    "san": board.san(move),
+                    "score": round(
+                        float(
+                            logits[
+                                move.from_square * 64 + move.to_square
+                            ].item()
+                        ),
+                        5,
+                    ),
+                }
+                for move in legal_ranked
+            ],
         }
 
     except HTTPException:
@@ -529,4 +827,3 @@ def debug_predict(fen: str):
             status_code=500,
             detail=f"{type(exc).__name__}: {exc}",
         )
-
