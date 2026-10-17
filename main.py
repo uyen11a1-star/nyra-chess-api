@@ -1,6 +1,8 @@
 import os
 import time
 import threading
+import math
+import random
 from pathlib import Path
 from typing import Any
 
@@ -13,13 +15,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 # ============================================================
-# NYRA CHESS API 0.9.5 (Tactical Upgrade)
-# - Check Extensions (Nhìn sâu hơn khi có chiếu tướng)
-# - Quiescence Checks (Bắt chiếu tướng ở tầng tĩnh lặng)
+# NYRA CHESS API 1.0.0 (MCTS Reasoning Engine)
+# - Thay thế Alpha-Beta bằng Monte Carlo Tree Search (MCTS)
+# - MCTS giúp AI "tưởng tượng" và suy luận chiến lược
 # ============================================================
 
 SERVICE_NAME = "Nyra Chess API"
-VERSION = "0.9.5"
+VERSION = "1.0.0"
 
 MODEL_URL = os.getenv("MODEL_URL", "").strip()
 HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
@@ -28,10 +30,9 @@ MODEL_PATH = Path(os.getenv("MODEL_PATH", "/tmp/nyra_chess_best.pt"))
 DEVICE = torch.device("cpu")
 torch.set_num_threads(1)
 
-SEARCH_DEPTH = max(1, int(os.getenv("SEARCH_DEPTH", "2")))
-MAX_SEARCH_NODES = max(50, min(100000, int(os.getenv("MAX_SEARCH_NODES", "350"))))
-SEARCH_TIME_LIMIT = max(0.25, min(28.0, float(os.getenv("SEARCH_TIME_LIMIT", "3.0"))))
-QUIESCENCE_DEPTH = max(0, min(6, int(os.getenv("QUIESCENCE_DEPTH", "3"))))
+# MCTS dùng thời gian để chạy mô phỏng, không dùng Depth
+SEARCH_TIME_LIMIT = max(1.0, min(28.0, float(os.getenv("SEARCH_TIME_LIMIT", "10.0"))))
+MCTS_SIMULATIONS = max(100, min(5000, int(os.getenv("MCTS_SIMULATIONS", "800"))))
 
 app = FastAPI(title=SERVICE_NAME, version=VERSION)
 
@@ -51,50 +52,16 @@ model_lock = threading.Lock()
 load_started = False
 
 MATE_SCORE = 100_000
-INF = 1_000_000
-
 PIECE_VALUES = {
     chess.PAWN: 100, chess.KNIGHT: 320, chess.BISHOP: 335,
     chess.ROOK: 500, chess.QUEEN: 900, chess.KING: 0,
 }
 
-# Zobrist Hashing
-ZOBRIST_PIECES = {}
-ZOBRIST_TURN = 0
-def init_zobrist():
-    global ZOBRIST_TURN
-    import random
-    rng = random.Random(42)
-    for pt in range(1, 7):
-        for c in (chess.WHITE, chess.BLACK):
-            for sq in range(64):
-                ZOBRIST_PIECES[(pt, c, sq)] = rng.getrandbits(64)
-    ZOBRIST_TURN = rng.getrandbits(64)
-
-init_zobrist()
-
-def get_zobrist_hash(board: chess.Board) -> int:
-    h = 0
-    for sq, piece in board.piece_map().items():
-        h ^= ZOBRIST_PIECES[(piece.piece_type, piece.color, sq)]
-    if board.turn == chess.BLACK:
-        h ^= ZOBRIST_TURN
-    return h
-
-TT = {}
-TT_MAX_SIZE = 50000
-
 OPENING_BOOK = {
     "r1bqkbnr/pppp1ppp/2n5/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R b KQkq - 3 3": "a7a6",
-    "r1bqkbnr/1ppp1ppp/p1n5/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 0 4": "b1c3",
     "rnbqkbnr/ppp2ppp/4p3/3p4/2PP4/8/PP2PPPP/RNBQKBNR w KQkq - 0 3": "b1c3",
-    "rnbqkbnr/ppp2ppp/4p3/3p4/2PP4/2N5/PP2PPPP/R1BQKBNR b KQkq - 1 3": "g8f6",
     "rnbqkbnr/pp2pppp/3p4/2p5/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 0 3": "d2d4",
-    "rnbqkbnr/pp2pppp/3p4/2p5/3PP3/5N2/PPP2PPP/RNBQKB1R b KQkq - 0 3": "c5d4",
     "r1bqk1nr/pppp1ppp/2n5/2b1p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4": "c2c3",
-    "rnbqkbnr/pppp1ppp/4p3/8/3PP3/8/PPP2PPP/RNBQKBNR b KQkq - 0 2": "d7d5",
-    "rnbqkbnr/pp1ppppp/2p5/8/3PP3/8/PPP2PPP/RNBQKBNR b KQkq - 0 2": "d7d5",
-    "rnbqkb1r/pppppp1p/5np1/8/2PP4/8/PP2PPPP/RNBQKBNR w KQkq - 0 3": "b1c3",
 }
 
 class ResidualBlock(nn.Module):
@@ -204,39 +171,19 @@ def encode_board(board: chess.Board) -> torch.Tensor:
         planes[17, chess.square_rank(board.ep_square), chess.square_file(board.ep_square)] = 1.0
     return planes.unsqueeze(0)
 
-def terminal_score(board: chess.Board, ply: int):
-    if board.is_checkmate(): return -MATE_SCORE + ply
-    if (board.is_stalemate() or board.is_insufficient_material() or 
-        board.is_fifty_moves() or board.is_repetition(3)): return 0
-    return None
+def get_policy_logits(board: chess.Board, current_model):
+    x = encode_board(board).to(DEVICE)
+    with torch.inference_mode():
+        return current_model(x)[0]
 
-def center_bonus(square: chess.Square) -> int:
-    file_idx = chess.square_file(square)
-    rank_idx = chess.square_rank(square)
-    distance = abs(3.5 - file_idx) + abs(3.5 - rank_idx)
-    return int(14 - 4 * distance)
+# ============================================================
+# HEURISTIC EVALUATION (Dùng để chấm điểm cuối ván mô phỏng)
+# ============================================================
+def evaluate_board(board: chess.Board) -> int:
+    if board.is_checkmate(): return -MATE_SCORE if board.turn == chess.WHITE else MATE_SCORE
+    if board.is_stalemate() or board.is_insufficient_material() or board.is_fifty_moves() or board.is_repetition(3): return 0
 
-def is_pinned(board: chess.Board, square: chess.Square, color: chess.Color) -> bool:
-    if board.piece_at(square).piece_type == chess.KING: return False
-    king_sq = board.king(color)
-    if king_sq is None: return False
-    for attacker in board.attackers(not color, square):
-        piece = board.piece_at(attacker)
-        if piece and piece.piece_type in (chess.BISHOP, chess.ROOK, chess.QUEEN):
-            board.push(chess.Move.null())
-            if board.is_attacked_by(not color, king_sq):
-                board.pop()
-                return True
-            board.pop()
-    return False
-
-def evaluate_white_score(board: chess.Board) -> int:
     score = 0
-    phase = 0
-    for piece in board.piece_map().values():
-        phase += {chess.KNIGHT: 1, chess.BISHOP: 1, chess.ROOK: 2, chess.QUEEN: 4}.get(piece.piece_type, 0)
-    endgame = phase <= 6
-
     for square, piece in board.piece_map().items():
         sign = 1 if piece.color == chess.WHITE else -1
         file_idx = chess.square_file(square)
@@ -248,15 +195,9 @@ def evaluate_white_score(board: chess.Board) -> int:
         if is_attacked and not is_defended and piece.piece_type != chess.KING:
             value -= int(PIECE_VALUES[piece.piece_type] * 0.8)
 
-        if is_pinned(board, square, piece.color) and piece.piece_type != chess.KING:
-            value -= int(PIECE_VALUES[piece.piece_type] * 0.5)
-
         if piece.piece_type == chess.PAWN:
             value += relative_rank * 5
             if file_idx in (3, 4): value += 5
-            own_pawns = board.pieces(chess.PAWN, piece.color)
-            has_adjacent = any(chess.square_file(sq) in (file_idx - 1, file_idx + 1) for sq in own_pawns)
-            if not has_adjacent: value -= 15
             enemy_pawns = board.pieces(chess.PAWN, not piece.color)
             same_or_adjacent = [f for f in (file_idx - 1, file_idx, file_idx + 1) if 0 <= f < 8]
             blocked = False
@@ -266,324 +207,122 @@ def evaluate_white_score(board: chess.Board) -> int:
                 if ef in same_or_adjacent and enemy_rel_rank > relative_rank:
                     blocked = True; break
             if not blocked: value += 8 + relative_rank * relative_rank * 2
-
         elif piece.piece_type == chess.KNIGHT:
-            value += center_bonus(square)
-            if 2 <= relative_rank <= 5 and board.attackers(piece.color, square):
-                if any(board.piece_at(p).piece_type == chess.PAWN for p in board.attackers(piece.color, square) if board.piece_at(p)):
-                    value += 25
+            value += int(14 - 4 * (abs(3.5 - file_idx) + abs(3.5 - relative_rank)))
         elif piece.piece_type == chess.BISHOP:
-            value += center_bonus(square) // 2
-        elif piece.piece_type == chess.ROOK:
-            own_pawns = board.pieces(chess.PAWN, piece.color)
-            enemy_pawns = board.pieces(chess.PAWN, not piece.color)
-            if not any(chess.square_file(s) == file_idx for s in own_pawns):
-                value += 20 if not any(chess.square_file(s) == file_idx for s in enemy_pawns) else 10
-            if relative_rank == 6: value += 15
-        elif piece.piece_type == chess.QUEEN:
-            if board.fullmove_number <= 10: value -= 8
+            value += int(7 - 2 * (abs(3.5 - file_idx) + abs(3.5 - relative_rank)))
         score += sign * value
 
     if len(board.pieces(chess.BISHOP, chess.WHITE)) >= 2: score += 35
     if len(board.pieces(chess.BISHOP, chess.BLACK)) >= 2: score -= 35
 
-    center_squares = [chess.D4, chess.E4, chess.D5, chess.E5]
-    for sq in center_squares:
-        if board.is_attacked_by(chess.WHITE, sq): score += 10
-        if board.is_attacked_by(chess.BLACK, sq): score -= 10
-
-    if board.fullmove_number <= 12 and phase >= 10:
-        for color in (chess.WHITE, chess.BLACK):
-            sign = 1 if color == chess.WHITE else -1
-            home_rank = 0 if color == chess.WHITE else 7
-            developed = sum(1 for pt in (chess.KNIGHT, chess.BISHOP) for sq in board.pieces(pt, color) if chess.square_rank(sq) != home_rank)
-            score += sign * developed * 10
-
-    for color in (chess.WHITE, chess.BLACK):
-        sign = 1 if color == chess.WHITE else -1
-        king_sq = board.king(color)
-        if king_sq is None: continue
-        kf, kr = chess.square_file(king_sq), chess.square_rank(king_sq)
-        home_rank = 0 if color == chess.WHITE else 7
-        castled = ((color == chess.WHITE and kr == 0 and kf in (2, 6)) or (color == chess.BLACK and kr == 7 and kf in (2, 6)))
-
-        if castled: 
-            score += sign * 70
-            direction = 1 if color == chess.WHITE else -1
-            shield = sum(1 for df in (-1, 0, 1) if 0 <= kf + df < 8 and 0 <= kr + direction < 8 and board.piece_at(chess.square(kf + df, kr + direction)) and board.piece_at(chess.square(kf + df, kr + direction)).color == color and board.piece_at(chess.square(kf + df, kr + direction)).piece_type == chess.PAWN)
-            if shield == 0: score -= sign * 60
-            elif shield == 1: score -= sign * 30
-
-        if not endgame and board.fullmove_number <= 20 and kr != home_rank and not castled: score -= sign * 45
-        if not endgame:
-            if kf in (3, 4) and board.fullmove_number > 8: score -= sign * 20
-            score -= sign * min(3, len(board.attackers(not color, king_sq))) * 14
-        else: score += sign * center_bonus(king_sq)
-
     if board.is_check(): score += -20 if board.turn == chess.WHITE else 20
-    return score
-
-def evaluate_board(board: chess.Board) -> int:
-    terminal = terminal_score(board, 0)
-    if terminal is not None: return terminal
-    score = evaluate_white_score(board)
     return score if board.turn == chess.WHITE else -score
 
-def get_policy_logits(board: chess.Board, current_model):
-    x = encode_board(board).to(DEVICE)
-    with torch.inference_mode():
-        return current_model(x)[0]
+# ============================================================
+# MONTE CARLO TREE SEARCH (MCTS)
+# ============================================================
+class MCTSNode:
+    def __init__(self, board: chess.Board, parent=None, move=None, prior=0.0):
+        self.board = board
+        self.parent = parent
+        self.move = move
+        self.prior = prior
+        self.children = []
+        self.visits = 0
+        self.value_sum = 0.0
+        self.is_expanded = False
 
-def move_capture_value(board: chess.Board, move: chess.Move) -> int:
-    if not board.is_capture(move): return 0
-    if board.is_en_passant(move): return 15_000 + 1000
-    victim = board.piece_at(move.to_square)
-    victim_value = PIECE_VALUES[victim.piece_type] if victim else 0
-    attacker = board.piece_at(move.from_square)
-    attacker_value = PIECE_VALUES[attacker.piece_type] if attacker else 0
-    return 10_000 + victim_value * 10 - attacker_value
+    def is_fully_expanded(self):
+        return self.is_expanded
 
-killer_moves = [[] for _ in range(64)]
+    def best_child(self, c_param=1.414):
+        choices_weights = [
+            (child.value_sum / child.visits) + c_param * child.prior * math.sqrt(self.visits) / (1 + child.visits)
+            for child in self.children
+        ]
+        return self.children[choices_weights.index(max(choices_weights))]
 
-def order_moves(board: chess.Board, moves, logits=None, ply=0):
-    ranked = []
-    for move in moves:
-        score = 0.0
-        if logits is not None:
-            score += float(logits[move.from_square * 64 + move.to_square].item())
+    def expand(self, current_model):
+        if self.is_expanded: return
+        legal_moves = list(self.board.legal_moves)
+        if not legal_moves: return
+
+        # Dùng mạng Neural để lấy xác suất (prior) cho các nước đi
+        logits = get_policy_logits(self.board, current_model).cpu()
+        probs = torch.softmax(logits, dim=0)
+
+        for move in legal_moves:
+            idx = move.from_square * 64 + move.to_square
+            prior_prob = float(probs[idx].item())
+            new_board = self.board.copy()
+            new_board.push(move)
+            self.children.append(MCTSNode(new_board, parent=self, move=move, prior=prior_prob))
         
-        if move.promotion: score += 5_000 + PIECE_VALUES.get(move.promotion, 0)
-        score += move_capture_value(board, move)
+        self.is_expanded = True
+
+def run_mcts(root_board: chess.Board, current_model, time_limit):
+    root = MCTSNode(root_board)
+    start_time = time.time()
+    simulations = 0
+
+    while time.time() - start_time < time_limit and simulations < MCTS_SIMULATIONS:
+        node = root
         
-        if ply < 64 and move in killer_moves[ply]:
-            score += 900
-
-        board.push(move)
-        if board.is_check(): score += 100
-        board.pop()
-        ranked.append((score, move))
-    ranked.sort(key=lambda item: item[0], reverse=True)
-    return [move for _, move in ranked]
-
-def order_moves_mvv_lva(board: chess.Board, moves, ply=0):
-    return order_moves(board, moves, logits=None, ply=ply)
-
-def should_stop(state) -> bool:
-    if state["nodes"] >= state["max_nodes"] or time.monotonic() >= state["deadline"]:
-        state["aborted"] = True
-        return True
-    return False
-
-def has_non_pawn_material(board: chess.Board, color: chess.Color) -> bool:
-    for pt in (chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN):
-        if board.pieces(pt, color):
-            return True
-    return False
-
-def quiescence(board, alpha, beta, state, ply, remaining):
-    state["nodes"] += 1
-    terminal = terminal_score(board, ply)
-    if terminal is not None: return terminal
-    if should_stop(state): return evaluate_board(board)
-
-    in_check = board.is_check()
-    if not in_check:
-        stand_pat = evaluate_board(board)
-        if stand_pat >= beta: return beta
-        alpha = max(alpha, stand_pat)
-        if remaining <= 0: return stand_pat
-        # Thêm điều kiện xét cả nước chiếu tướng trong Quiescence
-        moves = [m for m in board.legal_moves if board.is_capture(m) or m.promotion or board.gives_check(m)]
-        if not moves: return stand_pat
-    else:
-        moves = list(board.legal_moves)
-        if not moves: return -MATE_SCORE + ply
-        if remaining <= 0: return evaluate_board(board)
-
-    moves = order_moves_mvv_lva(board, moves, ply)
-    for move in moves:
-        if should_stop(state): break
-        board.push(move)
-        score = -quiescence(board, -beta, -alpha, state, ply + 1, remaining - 1)
-        board.pop()
-        if score >= beta: return beta
-        alpha = max(alpha, score)
-    return alpha
-
-def negamax(board, current_model, depth, alpha, beta, state, ply=0):
-    state["nodes"] += 1
-    terminal = terminal_score(board, ply)
-    if terminal is not None: return terminal
-    if should_stop(state): return evaluate_board(board)
-    
-    z_hash = get_zobrist_hash(board)
-    if z_hash in TT:
-        tt_depth, tt_score = TT[z_hash]
-        if tt_depth >= depth:
-            return tt_score
-
-    if depth <= 0: return quiescence(board, alpha, beta, state, ply, QUIESCENCE_DEPTH)
-
-    in_check = board.is_check()
-
-    if not in_check and depth >= 3 and has_non_pawn_material(board, board.turn):
-        board.push(chess.Move.null())
-        score = -negamax(board, current_model, depth - 3, -beta, -beta + 1, state, ply + 1)
-        board.pop()
-        if score >= beta:
-            return beta
-
-    moves = list(board.legal_moves)
-    if not moves: return evaluate_board(board)
-
-    if ply == 0:
-        logits = get_policy_logits(board, current_model)
-        moves = order_moves(board, moves, logits, ply)
-    else:
-        moves = order_moves_mvv_lva(board, moves, ply)
-
-    best_score = -INF
-    for i, move in enumerate(moves):
-        if should_stop(state): break
-        
-        is_tactical = board.is_capture(move) or move.promotion
-        gives_check = board.gives_check(move)
-        new_depth = depth - 1
-        
-        # CHECK EXTENSION: Nếu nước đi chiếu tướng, mở rộng độ sâu thêm 1 tầng
-        if gives_check:
-            new_depth += 1
-
-        if i >= 3 and depth >= 3 and not is_tactical and not in_check and not gives_check:
-            new_depth -= 1
-
-        board.push(move)
-        
-        if i == 0:
-            score = -negamax(board, current_model, new_depth, -beta, -alpha, state, ply + 1)
-        else:
-            score = -negamax(board, current_model, new_depth, -alpha - 1, -alpha, state, ply + 1)
-            if alpha < score < beta:
-                score = -negamax(board, current_model, new_depth, -beta, -alpha, state, ply + 1)
-
-        if new_depth < depth - 1 and score > alpha:
-            score = -negamax(board, current_model, depth - 1, -beta, -alpha, state, ply + 1)
+        # 1. Selection
+        while node.is_fully_expanded() and node.children:
+            node = node.best_child()
             
-        board.pop()
-        
-        if score > best_score:
-            best_score = score
-        alpha = max(alpha, score)
-        
-        if alpha >= beta:
-            if not is_tactical and ply < 64:
-                if move not in killer_moves[ply]:
-                    killer_moves[ply].insert(0, move)
-                    if len(killer_moves[ply]) > 2: killer_moves[ply].pop()
-            break
+        # 2. Expansion
+        if not node.board.is_game_over() and not node.is_fully_expanded():
+            node.expand(current_model)
+            if node.children:
+                node = node.children[0]
 
-    if len(TT) < TT_MAX_SIZE:
-        TT[z_hash] = (depth, best_score)
-    else:
-        TT.pop(next(iter(TT)))
+        # 3. Simulation (Rollout)
+        temp_board = node.board.copy()
+        depth = 0
+        while not temp_board.is_game_over() and depth < 20:
+            moves = list(temp_board.legal_moves)
+            if not moves: break
+            # Đi ngẫu nhiên có ưu tiên nước ăn quân
+            captures = [m for m in moves if temp_board.is_capture(m)]
+            move = random.choice(captures) if captures and random.random() < 0.5 else random.choice(moves)
+            temp_board.push(move)
+            depth += 1
 
-    if best_score == -INF: return evaluate_board(board)
-    return best_score
-
-def search_best_move(board, current_model, allowed_moves=None):
-    legal_moves = list(board.legal_moves)
-    if allowed_moves is not None:
-        allowed_uci = {move.uci() for move in allowed_moves}
-        legal_moves = [move for move in legal_moves if move.uci() in allowed_uci]
-
-    if not legal_moves: raise ValueError("No legal moves.")
-    
-    TT.clear()
-    for i in range(64): killer_moves[i].clear()
-
-    fen = board.fen()
-    short_fen = " ".join(fen.split(" ")[:4])
-    for book_fen, book_move in OPENING_BOOK.items():
-        if short_fen == " ".join(book_fen.split(" ")[:4]):
-            for m in legal_moves:
-                if m.uci() == book_move:
-                    return m, {"depth": 0, "requested_depth": SEARCH_DEPTH, "nodes": 0, "elapsed_ms": 0, "aborted": False, "score": None, "method": "Opening Book"}
-
-    if len(legal_moves) == 1:
-        return legal_moves[0], {"depth": 0, "requested_depth": SEARCH_DEPTH, "nodes": 0, "elapsed_ms": 0, "aborted": False, "score": None, "method": "forced_move"}
-
-    started = time.monotonic()
-    state = {"nodes": 0, "max_nodes": MAX_SEARCH_NODES, "deadline": started + SEARCH_TIME_LIMIT, "aborted": False}
-
-    root_logits = get_policy_logits(board, current_model)
-    ordered_root = order_moves(board, legal_moves, root_logits, ply=0)
-
-    best_move = ordered_root[0]
-    best_score = None
-    completed_depth = 0
-    prev_score = 0
-
-    for depth in range(1, SEARCH_DEPTH + 1):
-        if should_stop(state): break
-        iteration_move, iteration_score = None, -INF
-        
-        alpha, beta = -INF, INF
-        if depth >= 4 and prev_score is not None:
-            alpha = max(-INF, prev_score - 50)
-            beta = min(INF, prev_score + 50)
-
-        while True:
-            interrupted = False
-            for move in ordered_root:
-                if should_stop(state):
-                    interrupted = True
-                    break
-                board.push(move)
-                score = -negamax(board, current_model, depth - 1, -beta, -alpha, state, ply=1)
-                board.pop()
-
-                if score > iteration_score:
-                    iteration_score, iteration_move = score, move
-                alpha = max(alpha, score)
-                if state["aborted"]:
-                    interrupted = True
-                    break
-
-            if interrupted:
-                break
-            
-            if iteration_score <= prev_score - 50:
-                beta = alpha + 1
-                alpha = -INF
-            elif iteration_score >= prev_score + 50:
-                alpha = beta - 1
-                beta = INF
+        # 4. Backpropagation
+        result = evaluate_board(temp_board)
+        while node is not None:
+            node.visits += 1
+            if node.board.turn == chess.WHITE:
+                node.value_sum += result
             else:
-                break
+                node.value_sum -= result
+            node = node.parent
+        
+        simulations += 1
 
-        if iteration_move is not None and not interrupted:
-            best_move, best_score, completed_depth = iteration_move, iteration_score, depth
-            prev_score = best_score
-        else:
-            break
+    # Chọn nước đi có số lần duyệt (visits) nhiều nhất
+    best_move = None
+    max_visits = -1
+    for child in root.children:
+        if child.visits > max_visits:
+            max_visits = child.visits
+            best_move = child.move
 
-    return best_move, {
-        "depth": completed_depth,
-        "requested_depth": SEARCH_DEPTH,
-        "nodes": state["nodes"],
-        "elapsed_ms": int((time.monotonic() - started) * 1000),
-        "aborted": state["aborted"],
-        "score": None if best_score is None else int(best_score),
-        "method": "NyraNet v0.9.5 (Check Extensions)",
-    }
+    return best_move, simulations
 
+# ============================================================
+# ENDPOINT
+# ============================================================
 class MoveRequest(BaseModel):
     fen: str
     legal_moves: list[Any] = Field(default_factory=list)
 
 @app.get("/")
 def root():
-    return {"service": SERVICE_NAME, "version": VERSION, "health": "/health", "move": "/move", "search": {"depth": SEARCH_DEPTH, "max_nodes": MAX_SEARCH_NODES, "time_limit_seconds": SEARCH_TIME_LIMIT, "quiescence_depth": QUIESCENCE_DEPTH}}
+    return {"service": SERVICE_NAME, "version": VERSION, "health": "/health", "move": "/move", "search": {"type": "MCTS", "time_limit_seconds": SEARCH_TIME_LIMIT, "max_simulations": MCTS_SIMULATIONS}}
 
 @app.get("/health")
 def health():
@@ -602,7 +341,6 @@ def parse_supplied_legal_moves(board: chess.Board, supplied):
             move = chess.Move.from_uci(raw_uci)
             if move in board.legal_moves: allowed.add(move.uci())
         except (ValueError, TypeError): continue
-    if not allowed: raise HTTPException(status_code=400, detail="No valid legal_moves.")
     return [move for move in board.legal_moves if move.uci() in allowed]
 
 @app.post("/move")
@@ -620,8 +358,43 @@ def choose_move(request: MoveRequest):
 
     try:
         allowed_moves = parse_supplied_legal_moves(board, request.legal_moves)
-        best_move, search_info = search_best_move(board, current_model, allowed_moves=allowed_moves)
-        return {"uci": best_move.uci(), "san": board.san(best_move), "search": search_info}
+        if allowed_moves is not None:
+            board = chess.Board(request.fen)
+            # Lọc nước đi nếu frontend gửi lên
+            valid_moves = [m for m in board.legal_moves if m.uci() in [x.uci() for x in allowed_moves]]
+            if not valid_moves: raise ValueError("No legal moves.")
+        else:
+            valid_moves = list(board.legal_moves)
+
+        if len(valid_moves) == 1:
+            return {"uci": valid_moves[0].uci(), "san": board.san(valid_moves[0]), "search": {"type": "forced_move"}}
+
+        # Kiểm tra Opening Book
+        fen = board.fen()
+        short_fen = " ".join(fen.split(" ")[:4])
+        for book_fen, book_move in OPENING_BOOK.items():
+            if short_fen == " ".join(book_fen.split(" ")[:4]):
+                for m in valid_moves:
+                    if m.uci() == book_move:
+                        return {"uci": m.uci(), "san": board.san(m), "search": {"type": "Opening Book"}}
+
+        # Chạy MCTS
+        best_move, simulations = run_mcts(board, current_model, SEARCH_TIME_LIMIT)
+        
+        if best_move is None:
+            # Fallback nếu MCTS lỗi
+            best_move = random.choice(valid_moves)
+            simulations = 0
+
+        return {
+            "uci": best_move.uci(), 
+            "san": board.san(best_move), 
+            "search": {
+                "type": "MCTS",
+                "simulations": simulations,
+                "time_limit": SEARCH_TIME_LIMIT
+            }
+        }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Move search failed: {exc}")
 
