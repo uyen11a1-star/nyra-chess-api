@@ -13,14 +13,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 # ============================================================
-# NYRA CHESS API 0.7.1
-# - Fix: Deploy hang on Render (startup event)
-# - Speed: Transposition Table, Killer Moves
-# - Optimized encode_board (loop-free)
+# NYRA CHESS API 0.7.2
+# - Fix: Only call NN at root (ply==0) for 10x speedup
 # ============================================================
 
 SERVICE_NAME = "Nyra Chess API"
-VERSION = "0.7.1"
+VERSION = "0.7.2"
 
 MODEL_URL = os.getenv("MODEL_URL", "").strip()
 HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
@@ -59,7 +57,6 @@ PIECE_VALUES = {
     chess.ROOK: 500, chess.QUEEN: 900, chess.KING: 0,
 }
 
-# Zobrist Hashing để băm thế cờ
 ZOBRIST_PIECES = {}
 ZOBRIST_TURN = 0
 def init_zobrist():
@@ -82,7 +79,6 @@ def get_zobrist_hash(board: chess.Board) -> int:
         h ^= ZOBRIST_TURN
     return h
 
-# Transposition Table (Lưu trữ tạm thời)
 TT = {}
 TT_MAX_SIZE = 50000
 
@@ -393,7 +389,8 @@ def negamax(board, current_model, depth, alpha, beta, state, ply=0):
     moves = list(board.legal_moves)
     if not moves: return evaluate_board(board)
 
-    if ply <= 1:
+    # TỐI ƯU HÓA: Chỉ gọi mạng Neural ở nước đi gốc (Root)
+    if ply == 0:
         logits = get_policy_logits(board, current_model)
         moves = order_moves(board, moves, logits, ply)
     else:
@@ -490,7 +487,7 @@ def search_best_move(board, current_model, allowed_moves=None):
         "elapsed_ms": int((time.monotonic() - started) * 1000),
         "aborted": state["aborted"],
         "score": None if best_score is None else int(best_score),
-        "method": "NyraNet v0.7.1 + TT + Killer",
+        "method": "NyraNet v0.7.2 + TT + Killer",
     }
 
 class MoveRequest(BaseModel):
