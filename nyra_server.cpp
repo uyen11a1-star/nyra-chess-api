@@ -20,8 +20,10 @@ const int INF = 200000;
 Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "NyraNet");
 Ort::Session* session;
 const char* input_names[] = {"input"};
-const char* output_names[] = {"policy"};
+// Cập nhật lấy cả 2 đầu ra: Policy và Value
+const char* output_names[] = {"policy", "value"};
 
+// --- OPENING BOOK ---
 std::unordered_map<std::string, std::string> opening_book = {
     {"r1bqkbnr/pppp1ppp/2n5/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R b KQkq -", "a7a6"},
     {"r1bqk1nr/pppp1ppp/2n5/2b1p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq -", "c2c3"},
@@ -38,8 +40,8 @@ std::unordered_map<uint64_t, TTEntry> transposition_table;
 
 std::chrono::steady_clock::time_point start_time;
 bool time_is_up = false;
-const int TIME_LIMIT_MS = 3000; 
-const int MAX_DEPTH = 5; // Hạ xuống 5 để đảm bảo an toàn và tập trung vào Eval
+const int TIME_LIMIT_MS = 4000; 
+const int MAX_DEPTH = 6;
 
 void init_zobrist() {
     std::mt19937_64 rng(12345);
@@ -63,47 +65,68 @@ uint64_t get_hash(const Board& board) {
     return h;
 }
 
-// Hàm Eval nâng cao: Phạt cực nặng quân bị treo, thưởng phát triển quân
-int evaluate_board(const Board& board) {
-    if (board.isGameOver().second == GameResult::LOSE) return -MATE_SCORE;
-    if (board.isGameOver().second == GameResult::DRAW) return 0;
-
-    int score = 0;
+// --- HÀM MÃ HÓA BÀN CỜ (Giống Python) ---
+void encode_board(const Board& board, std::vector<float>& tensor) {
+    std::fill(tensor.begin(), tensor.end(), 0.0f);
     for (int sq = 0; sq < 64; sq++) {
         Piece piece = board.at(sq);
         if (piece != Piece::NONE) {
-            int sign = (piece.color() == Color::WHITE) ? 1 : -1;
-            int pt_idx = static_cast<int>(piece.type());
-            int val = PIECE_VALUES[pt_idx];
-            int rank = sq / 8; int file = sq % 8;
-            int dist = std::abs(3.5 - rank) + std::abs(3.5 - file);
-
-            Square s = static_cast<Square>(sq);
-            Color enemy = (piece.color() == Color::WHITE) ? Color::BLACK : Color::WHITE;
-            
-            // Bảo vệ quân: Bị tấn công mà không có ai đỡ -> Trừ điểm cực nặng
-            if (board.isAttacked(s, enemy) && !board.isAttacked(s, piece.color()) && piece.type() != PieceType::KING) {
-                val -= PIECE_VALUES[pt_idx] * 0.9; 
-            }
-
-            if (piece.type() == PieceType::PAWN) {
-                val += (14 - 4 * dist);
-                if (piece.color() == Color::WHITE) val += rank * 5; else val += (7 - rank) * 5;
-            } else if (piece.type() == PieceType::KNIGHT || piece.type() == PieceType::BISHOP) {
-                if (piece.color() == Color::WHITE && rank > 0) val += 30;
-                if (piece.color() == Color::BLACK && rank < 7) val += 30;
-                val += (14 - 4 * dist);
-            } else if (piece.type() == PieceType::KING) {
-                // Phạt vua chưa nhập thành
-                if (board.fullMoveNumber() <= 15) {
-                    if (piece.color() == Color::WHITE && sq == 4) val -= 50; // E1
-                    if (piece.color() == Color::BLACK && sq == 60) val -= 50; // E8
-                }
-            }
-            score += sign * val;
+            int plane = -1; int pt = static_cast<int>(piece.type());
+            if (piece.color() == Color::WHITE) plane = pt - 1;       
+            else plane = (pt - 1) + 6;            
+            tensor[plane * 64 + (sq / 8) * 8 + (sq % 8)] = 1.0f;
         }
     }
+    if (board.sideToMove() == Color::WHITE) {
+        for (int i = 0; i < 64; i++) tensor[12 * 64 + i] = 1.0f;
+    }
+}
+
+// --- HÀM ĐÁNH GIÁ BẰNG VALUE HEAD ---
+int evaluate_board_with_nn(Board& board) {
+    if (board.isGameOver().second == GameResult::LOSE) return -MATE_SCORE;
+    if (board.isGameOver().second == GameResult::DRAW) return 0;
+
+    std::vector<float> inputs(18 * 8 * 8);
+    encode_board(board, inputs);
+    std::array<int64_t, 4> shape{1, 18, 8, 8};
+    auto mem = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+    Ort::Value tensor = Ort::Value::CreateTensor<float>(mem, inputs.data(), inputs.size(), shape.data(), shape.size());
+    
+    auto outputs = session->Run(Ort::RunOptions{nullptr}, input_names, &tensor, 1, output_names, 2);
+    
+    // Lấy giá trị từ Value Head (output thứ 2)
+    float* value_out = outputs[1].GetTensorMutableData<float>();
+    float val = value_out[0]; // Từ -1.0 đến 1.0
+    
+    // Chuyển đổi sang thang điểm centipawn (100 điểm = 1 tốt)
+    int score = static_cast<int>(val * 1000); 
+    
+    // Trả về điểm từ góc nhìn của bên đang đi
     return (board.sideToMove() == Color::WHITE) ? score : -score;
+}
+
+// --- SẮP XẾP NƯỚC ĐI BẰNG POLICY HEAD ---
+void order_moves_with_nn(Board& board, Movelist& moves) {
+    std::vector<float> inputs(18 * 8 * 8);
+    encode_board(board, inputs);
+    std::array<int64_t, 4> shape{1, 18, 8, 8};
+    auto mem = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+    Ort::Value tensor = Ort::Value::CreateTensor<float>(mem, inputs.data(), inputs.size(), shape.data(), shape.size());
+    
+    auto outputs = session->Run(Ort::RunOptions{nullptr}, input_names, &tensor, 1, output_names, 2);
+    float* logits = outputs[0].GetTensorMutableData<float>(); // Output 0 là Policy
+
+    struct SM { Move m; float s; };
+    std::vector<SM> sm;
+    sm.reserve(moves.size());
+    for (int i = 0; i < moves.size(); i++) {
+        int idx = moves[i].from().index() * 64 + moves[i].to().index();
+        float s = logits[idx] + (board.isCapture(moves[i]) ? 1000.0f : 0.0f); 
+        sm.push_back({moves[i], s});
+    }
+    std::sort(sm.begin(), sm.end(), [](const SM& a, const SM& b) { return a.s > b.s; });
+    for (int i = 0; i < moves.size(); i++) moves[i] = sm[i].m;
 }
 
 void order_moves_mvv_lva(Board& board, Movelist& moves) {
@@ -124,9 +147,9 @@ void order_moves_mvv_lva(Board& board, Movelist& moves) {
 }
 
 int quiescence(Board& board, int alpha, int beta) {
-    if (time_is_up) return evaluate_board(board);
+    if (time_is_up) return evaluate_board_with_nn(board);
 
-    int stand_pat = evaluate_board(board);
+    int stand_pat = evaluate_board_with_nn(board);
     if (stand_pat >= beta) return beta;
     if (alpha < stand_pat) alpha = stand_pat;
 
@@ -148,7 +171,7 @@ int quiescence(Board& board, int alpha, int beta) {
 }
 
 int negamax(Board& board, int depth, int alpha, int beta, bool root = false) {
-    if (time_is_up) return evaluate_board(board);
+    if (time_is_up) return evaluate_board_with_nn(board);
 
     static int nodes = 0;
     nodes++;
@@ -156,7 +179,7 @@ int negamax(Board& board, int depth, int alpha, int beta, bool root = false) {
         auto now = std::chrono::steady_clock::now(); 
         if (std::chrono::duration_cast<std::chrono::milliseconds>(now - start_time).count() >= TIME_LIMIT_MS) {
             time_is_up = true;
-            return evaluate_board(board);
+            return evaluate_board_with_nn(board);
         }
     }
 
@@ -180,7 +203,8 @@ int negamax(Board& board, int depth, int alpha, int beta, bool root = false) {
     Movelist moves; movegen::legalmoves(moves, board);
     if (moves.size() == 0) return in_check ? -MATE_SCORE + depth : 0;
     
-    order_moves_mvv_lva(board, moves);
+    if (root) order_moves_with_nn(board, moves);
+    else order_moves_mvv_lva(board, moves);
     
     int best = -INF;
     Move best_move_in_node = moves[0];
@@ -238,7 +262,7 @@ std::string extract_fen(const std::string& body) {
 int main() {
     init_zobrist();
     Ort::SessionOptions opts; opts.SetIntraOpNumThreads(1);
-    std::cout << "Đang load mô hình ONNX..." << std::endl;
+    std::cout << "Đang load mô hình ONNX (V2 - Value Head)..." << std::endl;
     session = new Ort::Session(env, "nyra_net.onnx", opts);
 
     httplib::Server svr;
@@ -281,7 +305,9 @@ int main() {
 
             transposition_table.clear();
             transposition_table.reserve(100000); 
-            order_moves_mvv_lva(board, moves);
+            
+            // Gọi mạng Neural để sắp xếp nước đi ở gốc
+            order_moves_with_nn(board, moves);
             
             int best_score = -INF;
             Move best_move = moves[0];
