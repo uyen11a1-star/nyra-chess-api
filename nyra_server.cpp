@@ -38,6 +38,12 @@ enum TTFlag { EXACT, LOWERBOUND, UPPERBOUND };
 struct TTEntry { int depth; int score; TTFlag flag; Move best_move; };
 std::unordered_map<uint64_t, TTEntry> transposition_table;
 
+// --- BIẾN QUẢN LÝ THỜI GIAN ---
+std::chrono::steady_clock::time_point start_time;
+bool time_is_up = false;
+const int TIME_LIMIT_MS = 4000; // Tối đa 4 giây (Render timeout là 30s, nên 4s là cực kỳ an toàn)
+const int MAX_DEPTH = 8;        // Nhắm tới Depth 8, nhưng sẽ bị cắt bởi thời gian
+
 void init_zobrist() {
     std::mt19937_64 rng(12345);
     for (int pt = 1; pt <= 6; pt++)
@@ -98,6 +104,7 @@ int evaluate_board(const Board& board) {
 void order_moves_mvv_lva(Board& board, Movelist& moves) {
     struct SM { Move m; int s; };
     std::vector<SM> sm;
+    sm.reserve(moves.size());
     for (int i = 0; i < moves.size(); i++) {
         int score = 0;
         if (board.isCapture(moves[i])) {
@@ -111,19 +118,9 @@ void order_moves_mvv_lva(Board& board, Movelist& moves) {
     for (int i = 0; i < moves.size(); i++) moves[i] = sm[i].m;
 }
 
-bool has_non_pawn_material(const Board& board, Color color) {
-    for (int sq = 0; sq < 64; sq++) {
-        Piece p = board.at(sq);
-        if (p != Piece::NONE && p.color() == color) {
-            PieceType pt = p.type();
-            if (pt == PieceType::KNIGHT || pt == PieceType::BISHOP || pt == PieceType::ROOK || pt == PieceType::QUEEN)
-                return true;
-        }
-    }
-    return false;
-}
-
 int quiescence(Board& board, int alpha, int beta) {
+    if (time_is_up) return evaluate_board(board);
+
     int stand_pat = evaluate_board(board);
     if (stand_pat >= beta) return beta;
     if (alpha < stand_pat) alpha = stand_pat;
@@ -145,11 +142,29 @@ int quiescence(Board& board, int alpha, int beta) {
     return alpha;
 }
 
-// --- THUẬT TOÁN TÌM KIẾM NÂNG CAO ---
+// --- THUẬT TOÁN TÌM KIẾM (CÓ TIME LIMIT) ---
 int negamax(Board& board, int depth, int alpha, int beta, bool root = false) {
+    if (time_is_up) return evaluate_board(board);
+
+    static int nodes = 0;
+    nodes++;
+    if ((nodes & 2047) == 0) { // Cứ 2048 nodes kiểm tra thời gian 1 lần
+        auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(now - start_time).count() >= TIME_LIMIT_MS) {
+            time_is_up = true;
+            return evaluate_board(board);
+        }
+    }
+
     if (depth == 0) return quiescence(board, alpha, beta);
 
     bool in_check = board.inCheck();
+
+    // Kiểm soát RAM của Transposition Table (Tránh OOM)
+    if (transposition_table.size() > 150000) {
+        transposition_table.clear();
+        transposition_table.reserve(150000);
+    }
 
     uint64_t hash = get_hash(board);
     if (transposition_table.find(hash) != transposition_table.end()) {
@@ -177,12 +192,12 @@ int negamax(Board& board, int depth, int alpha, int beta, bool root = false) {
         int score;
         int new_depth = depth - 1 + extension;
 
-        // LMR - Dùng ép kiểu int để tránh lỗi tên Enum
+        // LMR (Late Move Reductions)
         if (i >= 3 && depth >= 3 && !in_check && !board.isCapture(moves[i]) && static_cast<int>(board.givesCheck(moves[i])) == 0) {
             new_depth -= 1; 
         }
 
-        // PVS
+        // PVS (Principal Variation Search)
         if (i == 0) {
             score = -negamax(board, new_depth, -beta, -alpha);
         } else {
@@ -209,10 +224,7 @@ int negamax(Board& board, int depth, int alpha, int beta, bool root = false) {
         }
     }
 
-    if (transposition_table.find(hash) == transposition_table.end() || transposition_table[hash].depth <= depth) {
-        transposition_table[hash] = {depth, best, flag, best_move_in_node};
-    }
-    
+    transposition_table[hash] = {depth, best, flag, best_move_in_node};
     return best;
 }
 
@@ -269,29 +281,77 @@ int main() {
         }
 
         transposition_table.clear();
+        transposition_table.reserve(150000); 
         order_moves_mvv_lva(board, moves);
         
         int best_score = -INF;
         Move best_move = moves[0];
-        int SEARCH_DEPTH = 6; 
+        int completed_depth = 0;
 
-        auto t0 = std::chrono::high_resolution_clock::now();
+        time_is_up = false;
+        start_time = std::chrono::steady_clock::now();
 
-        for (int i = 0; i < moves.size(); i++) {
-            board.makeMove(moves[i]);
-            int score = -negamax(board, SEARCH_DEPTH - 1, -INF, -best_score);
-            board.unmakeMove(moves[i]);
-            if (score > best_score) { best_score = score; best_move = moves[i]; }
+        // ITERATIVE DEEPENING (Tìm kiếm lặp)
+        for (int depth = 1; depth <= MAX_DEPTH; depth++) {
+            if (time_is_up) break;
+
+            int current_best_score = -INF;
+            Move current_best_move = moves[0];
+            
+            // ASPIRATION WINDOWS (Cửa sổ khao khát)
+            int alpha = -INF;
+            int beta = INF;
+            if (depth >= 4 && completed_depth > 0) {
+                alpha = std::max(-INF, best_score - 50);
+                beta = std::min(INF, best_score + 50);
+            }
+
+            while (true) {
+                bool break_while = false;
+                for (int i = 0; i < moves.size(); i++) {
+                    board.makeMove(moves[i]);
+                    int score = -negamax(board, depth - 1, -beta, -alpha);
+                    board.unmakeMove(moves[i]);
+
+                    if (time_is_up) { break_while = true; break; }
+
+                    if (score > current_best_score) {
+                        current_best_score = score;
+                        current_best_move = moves[i];
+                    }
+                    if (score > alpha) alpha = score;
+                    if (alpha >= beta) break;
+                }
+                
+                if (break_while || time_is_up) break;
+
+                // Nếu điểm số vượt ra ngoài cửa sổ Aspiration, mở rộng và tìm lại
+                if (current_best_score <= best_score - 50) {
+                    beta = alpha + 1;
+                    alpha = -INF;
+                } else if (current_best_score >= best_score + 50) {
+                    alpha = beta - 1;
+                    beta = INF;
+                } else {
+                    break; // Thành công trong cửa sổ
+                }
+            }
+
+            if (!time_is_up) {
+                best_move = current_best_move;
+                best_score = current_best_score;
+                completed_depth = depth;
+            }
         }
 
         auto t1 = std::chrono::high_resolution_clock::now();
-        int ms = (int)std::chrono::duration<double, std::milli>(t1 - t0).count();
+        int ms = (int)std::chrono::duration<double, std::milli>(t1 - start_time).count();
         
         std::string uci = uci::moveToUci(best_move);
-        std::string json_resp = "{\"uci\":\"" + uci + "\", \"search\":{\"depth\":" + std::to_string(SEARCH_DEPTH) + 
+        std::string json_resp = "{\"uci\":\"" + uci + "\", \"search\":{\"depth\":" + std::to_string(completed_depth) + 
                                 ", \"time_ms\":" + std::to_string(ms) + "}}";
         
-        std::cout << "FEN: " << fen << " -> " << uci << " (" << ms << "ms)" << std::endl;
+        std::cout << "FEN: " << fen_short << " -> " << uci << " (Depth: " << completed_depth << ", " << ms << "ms)" << (time_is_up ? " [TIMEOUT]" : "") << std::endl;
         res.set_content(json_resp, "application/json");
     });
 
