@@ -111,7 +111,6 @@ void order_moves_mvv_lva(Board& board, Movelist& moves) {
     for (int i = 0; i < moves.size(); i++) moves[i] = sm[i].m;
 }
 
-// Đã sửa hàm kiểm tra quân nặng để tương thích với thư viện mới
 bool has_non_pawn_material(const Board& board, Color color) {
     for (int sq = 0; sq < 64; sq++) {
         Piece p = board.at(sq);
@@ -178,12 +177,12 @@ int negamax(Board& board, int depth, int alpha, int beta, bool root = false) {
         int score;
         int new_depth = depth - 1 + extension;
 
-        // LMR (Late Move Reductions) - Sửa lại điều kiện so sánh với CheckType
-        if (i >= 3 && depth >= 3 && !in_check && !board.isCapture(moves[i]) && board.givesCheck(moves[i]) == CheckType::NONE) {
+        // LMR - Dùng ép kiểu int để tránh lỗi tên Enum
+        if (i >= 3 && depth >= 3 && !in_check && !board.isCapture(moves[i]) && static_cast<int>(board.givesCheck(moves[i])) == 0) {
             new_depth -= 1; 
         }
 
-        // PVS (Principal Variation Search)
+        // PVS
         if (i == 0) {
             score = -negamax(board, new_depth, -beta, -alpha);
         } else {
