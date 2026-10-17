@@ -16,8 +16,7 @@ const int PIECE_VALUES[7] = {0, 100, 320, 330, 500, 900, 20000};
 const int MATE_SCORE = 100000;
 const int INF = 200000;
 
-// --- PIECE SQUARE TABLES (PST) - Dạy AI biết vị trí quân cờ tốt ---
-// Dành cho quân Trắng, quân Đen sẽ lật ngược lại
+// --- PIECE SQUARE TABLES (PST) ---
 const int PAWN_PST[64] = {
     0,  0,  0,  0,  0,  0,  0,  0,
     50, 50, 50, 50, 50, 50, 50, 50,
@@ -113,7 +112,7 @@ uint64_t get_hash(const Board& board) {
     return h;
 }
 
-// --- MÃ HÓA ĐẦY ĐỦ 18 PLANES (Khắc phục lỗi mạng Neural) ---
+// --- MÃ HÓA ĐẦY ĐỦ 18 PLANES (Đã sửa cú pháp castling) ---
 void encode_board(const Board& board, std::vector<float>& tensor) {
     std::fill(tensor.begin(), tensor.end(), 0.0f);
     for (int sq = 0; sq < 64; sq++) {
@@ -128,19 +127,22 @@ void encode_board(const Board& board, std::vector<float>& tensor) {
     if (board.sideToMove() == Color::WHITE) {
         for (int i = 0; i < 64; i++) tensor[12 * 64 + i] = 1.0f;
     }
-    // Cập nhật đầy đủ Plane 13-17
-    if (board.castlingRights().has(CastlingRights::Side::KING_SIDE, Color::WHITE)) {
+    
+    // Sử dụng cú pháp mới của thư viện chess.hpp
+    CastlingRights rights = board.castlingRights();
+    if (rights & CastlingRights::WhiteKingSide) {
         for (int i = 0; i < 64; i++) tensor[13 * 64 + i] = 1.0f;
     }
-    if (board.castlingRights().has(CastlingRights::Side::QUEEN_SIDE, Color::WHITE)) {
+    if (rights & CastlingRights::WhiteQueenSide) {
         for (int i = 0; i < 64; i++) tensor[14 * 64 + i] = 1.0f;
     }
-    if (board.castlingRights().has(CastlingRights::Side::KING_SIDE, Color::BLACK)) {
+    if (rights & CastlingRights::BlackKingSide) {
         for (int i = 0; i < 64; i++) tensor[15 * 64 + i] = 1.0f;
     }
-    if (board.castlingRights().has(CastlingRights::Side::QUEEN_SIDE, Color::BLACK)) {
+    if (rights & CastlingRights::BlackQueenSide) {
         for (int i = 0; i < 64; i++) tensor[16 * 64 + i] = 1.0f;
     }
+    
     if (board.enpassantSq() != Square::underlying::NO_SQ) {
         int ep = board.enpassantSq().index();
         tensor[17 * 64 + ep] = 1.0f;
@@ -159,9 +161,8 @@ int evaluate_board(const Board& board) {
             int sign = (piece.color() == Color::WHITE) ? 1 : -1;
             int pt_idx = static_cast<int>(piece.type());
             int val = PIECE_VALUES[pt_idx];
-            int pst_sq = (piece.color() == Color::WHITE) ? sq : (sq ^ 56); // Lật ngược bàn cờ cho Đen
+            int pst_sq = (piece.color() == Color::WHITE) ? sq : (sq ^ 56);
 
-            // Cộng điểm từ Bảng PST
             if (piece.type() == PieceType::PAWN) val += PAWN_PST[pst_sq];
             else if (piece.type() == PieceType::KNIGHT) val += KNIGHT_PST[pst_sq];
             else if (piece.type() == PieceType::BISHOP) val += BISHOP_PST[pst_sq];
@@ -169,7 +170,6 @@ int evaluate_board(const Board& board) {
             else if (piece.type() == PieceType::QUEEN) val += QUEEN_PST[pst_sq];
             else if (piece.type() == PieceType::KING) val += KING_MID_PST[pst_sq];
 
-            // Phạt quân bị treo
             Square s = static_cast<Square>(sq);
             Color enemy = (piece.color() == Color::WHITE) ? Color::BLACK : Color::WHITE;
             if (board.isAttacked(s, enemy) && !board.isAttacked(s, piece.color()) && piece.type() != PieceType::KING) {
@@ -292,7 +292,6 @@ int negamax(Board& board, int depth, int alpha, int beta, bool root = false) {
         }
     }
 
-    // Ghi đè vào TT (Luôn ưu tiên độ sâu lớn hơn)
     if (transposition_table.find(hash) == transposition_table.end() || transposition_table[hash].depth <= depth) {
         transposition_table[hash] = {depth, best, flag, best_move_in_node};
     }
