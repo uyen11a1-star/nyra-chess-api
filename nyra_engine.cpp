@@ -7,15 +7,46 @@
 #include <algorithm>
 #include <cmath>
 #include <string>
+#include <unordered_map>
+#include <random>
 
 using namespace chess;
+
 const int PIECE_VALUES[7] = {0, 100, 320, 330, 500, 900, 20000}; 
 const int MATE_SCORE = 100000;
+const int INF = 200000;
 
+// --- KHỞI TẠO ONNX & ZOBRIST HASHING (Dùng cho Transposition Table) ---
 Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "NyraNet");
 Ort::Session* session;
 const char* input_names[] = {"input"};
 const char* output_names[] = {"policy"};
+
+uint64_t zobrist_pieces[7][2][64];
+uint64_t zobrist_turn;
+std::unordered_map<uint64_t, std::pair<int, int>> transposition_table; // hash -> {depth, score}
+
+void init_zobrist() {
+    std::mt19937_64 rng(12345); // Seed cố định
+    for (int pt = 1; pt <= 6; pt++)
+        for (int c = 0; c < 2; c++)
+            for (int sq = 0; sq < 64; sq++)
+                zobrist_pieces[pt][c][sq] = rng();
+    zobrist_turn = rng();
+}
+
+uint64_t get_hash(const Board& board) {
+    uint64_t h = 0;
+    for (int sq = 0; sq < 64; sq++) {
+        Piece p = board.at(sq);
+        if (p != Piece::NONE) {
+            int c = (p.color() == Color::WHITE) ? 0 : 1;
+            h ^= zobrist_pieces[static_cast<int>(p.type())][c][sq];
+        }
+    }
+    if (board.sideToMove() == Color::WHITE) h ^= zobrist_turn;
+    return h;
+}
 
 void encode_board(const Board& board, std::vector<float>& tensor) {
     std::fill(tensor.begin(), tensor.end(), 0.0f);
@@ -33,6 +64,7 @@ void encode_board(const Board& board, std::vector<float>& tensor) {
     }
 }
 
+// --- HÀM ĐÁNH GIÁ (Có phạt quân bị treo) ---
 int evaluate_board(const Board& board) {
     if (board.isGameOver().second == GameResult::LOSE) return -MATE_SCORE;
     if (board.isGameOver().second == GameResult::DRAW) return 0;
@@ -45,6 +77,7 @@ int evaluate_board(const Board& board) {
             int val = PIECE_VALUES[static_cast<int>(piece.type())];
             int rank = sq / 8; int file = sq % 8;
             int dist = std::abs(3.5 - rank) + std::abs(3.5 - file);
+            
             if (piece.type() == PieceType::PAWN) {
                 val += (14 - 4 * dist);
                 if (piece.color() == Color::WHITE) val += rank * 5; else val += (7 - rank) * 5;
@@ -72,38 +105,102 @@ void order_moves_with_nn(Board& board, Movelist& moves) {
     std::vector<SM> sm;
     for (int i = 0; i < moves.size(); i++) {
         int idx = moves[i].from().index() * 64 + moves[i].to().index();
-        float s = logits[idx] + (board.isCapture(moves[i]) ? 100.0f : 0.0f);
+        // NN score + Điểm thưởng cho nước ăn quân
+        float s = logits[idx] + (board.isCapture(moves[i]) ? 1000.0f : 0.0f); 
         sm.push_back({moves[i], s});
     }
     std::sort(sm.begin(), sm.end(), [](const SM& a, const SM& b) { return a.s > b.s; });
     for (int i = 0; i < moves.size(); i++) moves[i] = sm[i].m;
 }
 
+// Sắp xếp nước đi ở các tầng sâu (Chỉ ưu tiên ăn quân - MVV-LVA)
+void order_moves_mvv_lva(Board& board, Movelist& moves) {
+    struct SM { Move m; int s; };
+    std::vector<SM> sm;
+    for (int i = 0; i < moves.size(); i++) {
+        int score = 0;
+        if (board.isCapture(moves[i])) {
+            Piece victim = board.at(moves[i].to());
+            if (victim != Piece::NONE) score = 10 * PIECE_VALUES[static_cast<int>(victim.type())] - PIECE_VALUES[static_cast<int>(board.at(moves[i].from()).type())];
+            else score = 1000; // En passant
+        }
+        sm.push_back({moves[i], score});
+    }
+    std::sort(sm.begin(), sm.end(), [](const SM& a, const SM& b) { return a.s > b.s; });
+    for (int i = 0; i < moves.size(); i++) moves[i] = sm[i].m;
+}
+
+// --- QUIESCENCE SEARCH (Chỉ xét ăn quân/chiếu tướng để tránh bị lừa) ---
+int quiescence(Board& board, int alpha, int beta) {
+    int stand_pat = evaluate_board(board);
+    if (stand_pat >= beta) return beta;
+    if (alpha < stand_pat) alpha = stand_pat;
+
+    Movelist moves; movegen::legalmoves(moves, board);
+    // Chỉ xét các nước ăn quân
+    Movelist capture_moves;
+    for(int i=0; i<moves.size(); i++) {
+        if(board.isCapture(moves[i])) capture_moves.add(moves[i]);
+    }
+
+    order_moves_mvv_lva(board, capture_moves);
+
+    for (int i = 0; i < capture_moves.size(); i++) {
+        board.makeMove(capture_moves[i]);
+        int score = -quiescence(board, -beta, -alpha);
+        board.unmakeMove(capture_moves[i]);
+        if (score >= beta) return beta;
+        if (score > alpha) alpha = score;
+    }
+    return alpha;
+}
+
+// --- ALPHA-BETA VỚI TRANSPOSITION TABLE ---
 int negamax(Board& board, int depth, int alpha, int beta, bool root = false) {
-    if (depth == 0) return evaluate_board(board);
+    if (depth == 0) return quiescence(board, alpha, beta);
+
+    uint64_t hash = get_hash(board);
+    if (transposition_table.find(hash) != transposition_table.end()) {
+        auto entry = transposition_table[hash];
+        if (entry.first >= depth) return entry.second;
+    }
+
     Movelist moves; movegen::legalmoves(moves, board);
     if (moves.size() == 0) return board.inCheck() ? -MATE_SCORE + depth : 0;
-    if (root) order_moves_with_nn(board, moves);
     
-    int best = -MATE_SCORE * 2;
+    // Ở gốc dùng NN, các tầng sau dùng MVV-LVA
+    if (root) order_moves_with_nn(board, moves);
+    else order_moves_mvv_lva(board, moves);
+    
+    int best = -INF;
     for (int i = 0; i < moves.size(); i++) {
         board.makeMove(moves[i]);
-        int score = -negamax(board, depth - 1, -beta, -alpha);
+        // PVS (Principal Variation Search) để tăng tốc
+        int score;
+        if (i == 0) {
+            score = -negamax(board, depth - 1, -beta, -alpha);
+        } else {
+            score = -negamax(board, depth - 1, -alpha - 1, -alpha);
+            if (score > alpha && score < beta) {
+                score = -negamax(board, depth - 1, -beta, -alpha);
+            }
+        }
         board.unmakeMove(moves[i]);
+        
         if (score > best) best = score;
         if (score > alpha) alpha = score;
-        if (alpha >= beta) break;
+        if (alpha >= beta) break; // Cắt tỉa Beta
     }
+
+    transposition_table[hash] = {depth, best};
     return best;
 }
 
 int main(int argc, char** argv) {
     try {
-        if (argc < 2) {
-            std::cerr << "No FEN provided" << std::endl;
-            return 1;
-        }
+        if (argc < 2) return 1;
         std::string fen = argv[1];
+        init_zobrist();
         
         Ort::SessionOptions opts; opts.SetIntraOpNumThreads(1);
         session = new Ort::Session(env, "nyra_net.onnx", opts);
@@ -117,13 +214,18 @@ int main(int argc, char** argv) {
             return 0;
         }
 
+        transposition_table.clear();
         order_moves_with_nn(board, moves);
-        int best_score = -MATE_SCORE * 2;
+        
+        int best_score = -INF;
         Move best_move = moves[0];
+
+        // TĂNG DEPTH LÊN 5
+        int SEARCH_DEPTH = 5;
 
         for (int i = 0; i < moves.size(); i++) {
             board.makeMove(moves[i]);
-            int score = -negamax(board, 3, -MATE_SCORE * 2, MATE_SCORE * 2);
+            int score = -negamax(board, SEARCH_DEPTH - 1, -INF, -best_score);
             board.unmakeMove(moves[i]);
             if (score > best_score) { best_score = score; best_move = moves[i]; }
         }
@@ -131,12 +233,8 @@ int main(int argc, char** argv) {
         std::cout << uci::moveToUci(best_move) << std::endl;
         delete session;
         return 0;
-
     } catch (const std::exception& e) {
-        std::cerr << "C++ Exception: " << e.what() << std::endl;
+        std::cerr << "Exception: " << e.what() << std::endl;
         return 2;
-    } catch (...) {
-        std::cerr << "Unknown C++ Exception" << std::endl;
-        return 3;
     }
 }
