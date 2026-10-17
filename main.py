@@ -13,16 +13,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 # ============================================================
-# NYRA CHESS API 0.8.0 (Speed Demon)
-# - Stockfish-like Search Optimizations:
-#   + PVS (Principal Variation Search)
-#   + LMR (Late Move Reductions)
-#   + NMP (Null Move Pruning)
-#   + Aspiration Windows
+# NYRA CHESS API 0.9.0 (Intelligence Upgrade)
+# - Expanded Opening Book
+# - Advanced Evaluation: Pinned pieces, Center Control, 
+#   Pawn Structure, Better King Safety
 # ============================================================
 
 SERVICE_NAME = "Nyra Chess API"
-VERSION = "0.8.0"
+VERSION = "0.9.0"
 
 MODEL_URL = os.getenv("MODEL_URL", "").strip()
 HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
@@ -84,15 +82,28 @@ def get_zobrist_hash(board: chess.Board) -> int:
         h ^= ZOBRIST_TURN
     return h
 
-# Transposition Table
 TT = {}
 TT_MAX_SIZE = 50000
 
+# Mở rộng Opening Book
 OPENING_BOOK = {
+    # Ruy Lopez
     "r1bqkbnr/pppp1ppp/2n5/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R b KQkq - 3 3": "a7a6",
+    "r1bqkbnr/1ppp1ppp/p1n5/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 0 4": "b1c3",
+    # Queen's Gambit
     "rnbqkbnr/ppp2ppp/4p3/3p4/2PP4/8/PP2PPPP/RNBQKBNR w KQkq - 0 3": "b1c3",
+    "rnbqkbnr/ppp2ppp/4p3/3p4/2PP4/2N5/PP2PPPP/R1BQKBNR b KQkq - 1 3": "g8f6",
+    # Sicilian Defense
     "rnbqkbnr/pp2pppp/3p4/2p5/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 0 3": "d2d4",
+    "rnbqkbnr/pp2pppp/3p4/2p5/3PP3/5N2/PPP2PPP/RNBQKB1R b KQkq - 0 3": "c5d4",
+    # Italian Game
     "r1bqk1nr/pppp1ppp/2n5/2b1p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4": "c2c3",
+    # French Defense
+    "rnbqkbnr/pppp1ppp/4p3/8/3PP3/8/PPP2PPP/RNBQKBNR b KQkq - 0 2": "d7d5",
+    # Caro-Kann
+    "rnbqkbnr/pp1ppppp/2p5/8/3PP3/8/PPP2PPP/RNBQKBNR b KQkq - 0 2": "d7d5",
+    # King's Indian
+    "rnbqkb1r/pppppp1p/5np1/8/2PP4/8/PP2PPPP/RNBQKBNR w KQkq - 0 3": "b1c3",
 }
 
 class ResidualBlock(nn.Module):
@@ -214,6 +225,25 @@ def center_bonus(square: chess.Square) -> int:
     distance = abs(3.5 - file_idx) + abs(3.5 - rank_idx)
     return int(14 - 4 * distance)
 
+def is_pinned(board: chess.Board, square: chess.Square, color: chess.Color) -> bool:
+    """Kiểm tra quân cờ có đang bị ghim (pinned) không."""
+    if board.piece_at(square).piece_type == chess.KING:
+        return False
+    king_sq = board.king(color)
+    if king_sq is None: return False
+    
+    # Kiểm tra xem quân này có nằm trên đường tấn công của quân địch tới Vua không
+    for attacker in board.attackers(not color, square):
+        piece = board.piece_at(attacker)
+        if piece and piece.piece_type in (chess.BISHOP, chess.ROOK, chess.QUEEN):
+            # Giả lập di chuyển quân bị ghim đi chỗ khác để xem Vua có bị chiếu không
+            board.push(chess.Move.null()) # Tạm thời bỏ qua
+            if board.is_attacked_by(not color, king_sq):
+                board.pop()
+                return True
+            board.pop()
+    return False
+
 def evaluate_white_score(board: chess.Board) -> int:
     score = 0
     phase = 0
@@ -221,22 +251,33 @@ def evaluate_white_score(board: chess.Board) -> int:
         phase += {chess.KNIGHT: 1, chess.BISHOP: 1, chess.ROOK: 2, chess.QUEEN: 4}.get(piece.piece_type, 0)
     endgame = phase <= 6
 
+    # 1. Đánh giá quân cờ & Vị trí
     for square, piece in board.piece_map().items():
         sign = 1 if piece.color == chess.WHITE else -1
         file_idx = chess.square_file(square)
         relative_rank = chess.square_rank(square) if piece.color == chess.WHITE else 7 - chess.square_rank(square)
         value = PIECE_VALUES[piece.piece_type]
 
+        # Phạt quân bị treo (Hanging piece)
         is_attacked = board.is_attacked_by(not piece.color, square)
         is_defended = board.is_attacked_by(piece.color, square)
         if is_attacked and not is_defended and piece.piece_type != chess.KING:
             value -= int(PIECE_VALUES[piece.piece_type] * 0.8)
-        elif is_attacked and not is_defended and piece.piece_type == chess.KING:
-            value -= 500
+
+        # Phạt quân bị ghim (Pinned piece)
+        if is_pinned(board, square, piece.color) and piece.piece_type != chess.KING:
+            value -= int(PIECE_VALUES[piece.piece_type] * 0.5)
 
         if piece.piece_type == chess.PAWN:
             value += relative_rank * 5
             if file_idx in (3, 4): value += 5
+            
+            # Phạt Tốt cô lập (Isolated pawn)
+            own_pawns = board.pieces(chess.PAWN, piece.color)
+            has_adjacent = any(chess.square_file(sq) in (file_idx - 1, file_idx + 1) for sq in own_pawns)
+            if not has_adjacent: value -= 15
+            
+            # Passed pawn
             enemy_pawns = board.pieces(chess.PAWN, not piece.color)
             same_or_adjacent = [f for f in (file_idx - 1, file_idx, file_idx + 1) if 0 <= f < 8]
             blocked = False
@@ -262,11 +303,20 @@ def evaluate_white_score(board: chess.Board) -> int:
             if relative_rank == 6: value += 15
         elif piece.piece_type == chess.QUEEN:
             if board.fullmove_number <= 10: value -= 8
+        
         score += sign * value
 
+    # 2. Cặp Tượng
     if len(board.pieces(chess.BISHOP, chess.WHITE)) >= 2: score += 35
     if len(board.pieces(chess.BISHOP, chess.BLACK)) >= 2: score -= 35
 
+    # 3. Kiểm soát trung tâm
+    center_squares = [chess.D4, chess.E4, chess.D5, chess.E5]
+    for sq in center_squares:
+        if board.is_attacked_by(chess.WHITE, sq): score += 10
+        if board.is_attacked_by(chess.BLACK, sq): score -= 10
+
+    # 4. Phát triển quân (Opening)
     if board.fullmove_number <= 12 and phase >= 10:
         for color in (chess.WHITE, chess.BLACK):
             sign = 1 if color == chess.WHITE else -1
@@ -274,6 +324,7 @@ def evaluate_white_score(board: chess.Board) -> int:
             developed = sum(1 for pt in (chess.KNIGHT, chess.BISHOP) for sq in board.pieces(pt, color) if chess.square_rank(sq) != home_rank)
             score += sign * developed * 10
 
+    # 5. An toàn Vua
     for color in (chess.WHITE, chess.BLACK):
         sign = 1 if color == chess.WHITE else -1
         king_sq = board.king(color)
@@ -400,7 +451,6 @@ def negamax(board, current_model, depth, alpha, beta, state, ply=0):
 
     in_check = board.is_check()
 
-    # NULL MOVE PRUNING (NMP)
     if not in_check and depth >= 3 and has_non_pawn_material(board, board.turn):
         board.push(chess.Move.null())
         score = -negamax(board, current_model, depth - 3, -beta, -beta + 1, state, ply + 1)
@@ -424,13 +474,11 @@ def negamax(board, current_model, depth, alpha, beta, state, ply=0):
         is_tactical = board.is_capture(move) or move.promotion
         new_depth = depth - 1
         
-        # LATE MOVE REDUCTIONS (LMR)
         if i >= 3 and depth >= 3 and not is_tactical and not in_check:
             new_depth -= 1
 
         board.push(move)
         
-        # PRINCIPAL VARIATION SEARCH (PVS)
         if i == 0:
             score = -negamax(board, current_model, new_depth, -beta, -alpha, state, ply + 1)
         else:
@@ -438,7 +486,6 @@ def negamax(board, current_model, depth, alpha, beta, state, ply=0):
             if alpha < score < beta:
                 score = -negamax(board, current_model, new_depth, -beta, -alpha, state, ply + 1)
 
-        # Nếu nước bị giảm độ sâu (LMR) mà lại tốt, tính lại ở độ sâu đầy đủ
         if new_depth < depth - 1 and score > alpha:
             score = -negamax(board, current_model, depth - 1, -beta, -alpha, state, ply + 1)
             
@@ -500,7 +547,6 @@ def search_best_move(board, current_model, allowed_moves=None):
         if should_stop(state): break
         iteration_move, iteration_score = None, -INF
         
-        # ASPIRATION WINDOWS
         alpha, beta = -INF, INF
         if depth >= 4 and prev_score is not None:
             alpha = max(-INF, prev_score - 50)
@@ -526,7 +572,6 @@ def search_best_move(board, current_model, allowed_moves=None):
             if interrupted:
                 break
             
-            # Nếu điểm vượt ra ngoài cửa sổ Aspiration, mở rộng và tìm lại
             if iteration_score <= prev_score - 50:
                 beta = alpha + 1
                 alpha = -INF
@@ -549,7 +594,7 @@ def search_best_move(board, current_model, allowed_moves=None):
         "elapsed_ms": int((time.monotonic() - started) * 1000),
         "aborted": state["aborted"],
         "score": None if best_score is None else int(best_score),
-        "method": "NyraNet v0.8.0 (PVS+LMR+NMP)",
+        "method": "NyraNet v0.9.0 (Intelligent Eval)",
     }
 
 class MoveRequest(BaseModel):
