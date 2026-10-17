@@ -13,14 +13,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 # ============================================================
-# NYRA CHESS API 0.9.0 (Intelligence Upgrade)
-# - Expanded Opening Book
-# - Advanced Evaluation: Pinned pieces, Center Control, 
-#   Pawn Structure, Better King Safety
+# NYRA CHESS API 0.9.5 (Tactical Upgrade)
+# - Check Extensions (Nhìn sâu hơn khi có chiếu tướng)
+# - Quiescence Checks (Bắt chiếu tướng ở tầng tĩnh lặng)
 # ============================================================
 
 SERVICE_NAME = "Nyra Chess API"
-VERSION = "0.9.0"
+VERSION = "0.9.5"
 
 MODEL_URL = os.getenv("MODEL_URL", "").strip()
 HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
@@ -85,24 +84,16 @@ def get_zobrist_hash(board: chess.Board) -> int:
 TT = {}
 TT_MAX_SIZE = 50000
 
-# Mở rộng Opening Book
 OPENING_BOOK = {
-    # Ruy Lopez
     "r1bqkbnr/pppp1ppp/2n5/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R b KQkq - 3 3": "a7a6",
     "r1bqkbnr/1ppp1ppp/p1n5/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 0 4": "b1c3",
-    # Queen's Gambit
     "rnbqkbnr/ppp2ppp/4p3/3p4/2PP4/8/PP2PPPP/RNBQKBNR w KQkq - 0 3": "b1c3",
     "rnbqkbnr/ppp2ppp/4p3/3p4/2PP4/2N5/PP2PPPP/R1BQKBNR b KQkq - 1 3": "g8f6",
-    # Sicilian Defense
     "rnbqkbnr/pp2pppp/3p4/2p5/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 0 3": "d2d4",
     "rnbqkbnr/pp2pppp/3p4/2p5/3PP3/5N2/PPP2PPP/RNBQKB1R b KQkq - 0 3": "c5d4",
-    # Italian Game
     "r1bqk1nr/pppp1ppp/2n5/2b1p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4": "c2c3",
-    # French Defense
     "rnbqkbnr/pppp1ppp/4p3/8/3PP3/8/PPP2PPP/RNBQKBNR b KQkq - 0 2": "d7d5",
-    # Caro-Kann
     "rnbqkbnr/pp1ppppp/2p5/8/3PP3/8/PPP2PPP/RNBQKBNR b KQkq - 0 2": "d7d5",
-    # King's Indian
     "rnbqkb1r/pppppp1p/5np1/8/2PP4/8/PP2PPPP/RNBQKBNR w KQkq - 0 3": "b1c3",
 }
 
@@ -226,18 +217,13 @@ def center_bonus(square: chess.Square) -> int:
     return int(14 - 4 * distance)
 
 def is_pinned(board: chess.Board, square: chess.Square, color: chess.Color) -> bool:
-    """Kiểm tra quân cờ có đang bị ghim (pinned) không."""
-    if board.piece_at(square).piece_type == chess.KING:
-        return False
+    if board.piece_at(square).piece_type == chess.KING: return False
     king_sq = board.king(color)
     if king_sq is None: return False
-    
-    # Kiểm tra xem quân này có nằm trên đường tấn công của quân địch tới Vua không
     for attacker in board.attackers(not color, square):
         piece = board.piece_at(attacker)
         if piece and piece.piece_type in (chess.BISHOP, chess.ROOK, chess.QUEEN):
-            # Giả lập di chuyển quân bị ghim đi chỗ khác để xem Vua có bị chiếu không
-            board.push(chess.Move.null()) # Tạm thời bỏ qua
+            board.push(chess.Move.null())
             if board.is_attacked_by(not color, king_sq):
                 board.pop()
                 return True
@@ -251,33 +237,26 @@ def evaluate_white_score(board: chess.Board) -> int:
         phase += {chess.KNIGHT: 1, chess.BISHOP: 1, chess.ROOK: 2, chess.QUEEN: 4}.get(piece.piece_type, 0)
     endgame = phase <= 6
 
-    # 1. Đánh giá quân cờ & Vị trí
     for square, piece in board.piece_map().items():
         sign = 1 if piece.color == chess.WHITE else -1
         file_idx = chess.square_file(square)
         relative_rank = chess.square_rank(square) if piece.color == chess.WHITE else 7 - chess.square_rank(square)
         value = PIECE_VALUES[piece.piece_type]
 
-        # Phạt quân bị treo (Hanging piece)
         is_attacked = board.is_attacked_by(not piece.color, square)
         is_defended = board.is_attacked_by(piece.color, square)
         if is_attacked and not is_defended and piece.piece_type != chess.KING:
             value -= int(PIECE_VALUES[piece.piece_type] * 0.8)
 
-        # Phạt quân bị ghim (Pinned piece)
         if is_pinned(board, square, piece.color) and piece.piece_type != chess.KING:
             value -= int(PIECE_VALUES[piece.piece_type] * 0.5)
 
         if piece.piece_type == chess.PAWN:
             value += relative_rank * 5
             if file_idx in (3, 4): value += 5
-            
-            # Phạt Tốt cô lập (Isolated pawn)
             own_pawns = board.pieces(chess.PAWN, piece.color)
             has_adjacent = any(chess.square_file(sq) in (file_idx - 1, file_idx + 1) for sq in own_pawns)
             if not has_adjacent: value -= 15
-            
-            # Passed pawn
             enemy_pawns = board.pieces(chess.PAWN, not piece.color)
             same_or_adjacent = [f for f in (file_idx - 1, file_idx, file_idx + 1) if 0 <= f < 8]
             blocked = False
@@ -303,20 +282,16 @@ def evaluate_white_score(board: chess.Board) -> int:
             if relative_rank == 6: value += 15
         elif piece.piece_type == chess.QUEEN:
             if board.fullmove_number <= 10: value -= 8
-        
         score += sign * value
 
-    # 2. Cặp Tượng
     if len(board.pieces(chess.BISHOP, chess.WHITE)) >= 2: score += 35
     if len(board.pieces(chess.BISHOP, chess.BLACK)) >= 2: score -= 35
 
-    # 3. Kiểm soát trung tâm
     center_squares = [chess.D4, chess.E4, chess.D5, chess.E5]
     for sq in center_squares:
         if board.is_attacked_by(chess.WHITE, sq): score += 10
         if board.is_attacked_by(chess.BLACK, sq): score -= 10
 
-    # 4. Phát triển quân (Opening)
     if board.fullmove_number <= 12 and phase >= 10:
         for color in (chess.WHITE, chess.BLACK):
             sign = 1 if color == chess.WHITE else -1
@@ -324,7 +299,6 @@ def evaluate_white_score(board: chess.Board) -> int:
             developed = sum(1 for pt in (chess.KNIGHT, chess.BISHOP) for sq in board.pieces(pt, color) if chess.square_rank(sq) != home_rank)
             score += sign * developed * 10
 
-    # 5. An toàn Vua
     for color in (chess.WHITE, chess.BLACK):
         sign = 1 if color == chess.WHITE else -1
         king_sq = board.king(color)
@@ -418,7 +392,8 @@ def quiescence(board, alpha, beta, state, ply, remaining):
         if stand_pat >= beta: return beta
         alpha = max(alpha, stand_pat)
         if remaining <= 0: return stand_pat
-        moves = [m for m in board.legal_moves if board.is_capture(m) or m.promotion]
+        # Thêm điều kiện xét cả nước chiếu tướng trong Quiescence
+        moves = [m for m in board.legal_moves if board.is_capture(m) or m.promotion or board.gives_check(m)]
         if not moves: return stand_pat
     else:
         moves = list(board.legal_moves)
@@ -472,9 +447,14 @@ def negamax(board, current_model, depth, alpha, beta, state, ply=0):
         if should_stop(state): break
         
         is_tactical = board.is_capture(move) or move.promotion
+        gives_check = board.gives_check(move)
         new_depth = depth - 1
         
-        if i >= 3 and depth >= 3 and not is_tactical and not in_check:
+        # CHECK EXTENSION: Nếu nước đi chiếu tướng, mở rộng độ sâu thêm 1 tầng
+        if gives_check:
+            new_depth += 1
+
+        if i >= 3 and depth >= 3 and not is_tactical and not in_check and not gives_check:
             new_depth -= 1
 
         board.push(move)
@@ -594,7 +574,7 @@ def search_best_move(board, current_model, allowed_moves=None):
         "elapsed_ms": int((time.monotonic() - started) * 1000),
         "aborted": state["aborted"],
         "score": None if best_score is None else int(best_score),
-        "method": "NyraNet v0.9.0 (Intelligent Eval)",
+        "method": "NyraNet v0.9.5 (Check Extensions)",
     }
 
 class MoveRequest(BaseModel):
