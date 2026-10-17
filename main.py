@@ -28,7 +28,7 @@ MODEL_PATH = Path(os.getenv("MODEL_PATH", "/tmp/nyra_chess_best.pt"))
 DEVICE = torch.device("cpu")
 torch.set_num_threads(1)
 
-SEARCH_DEPTH = max(1, min(4, int(os.getenv("SEARCH_DEPTH", "2"))))
+SEARCH_DEPTH = max(1,  int(os.getenv("SEARCH_DEPTH", "2"))))
 MAX_SEARCH_NODES = max(50, min(10000, int(os.getenv("MAX_SEARCH_NODES", "350"))))
 SEARCH_TIME_LIMIT = max(0.25, min(30.0, float(os.getenv("SEARCH_TIME_LIMIT", "3.0"))))
 QUIESCENCE_DEPTH = max(0, min(6, int(os.getenv("QUIESCENCE_DEPTH", "3"))))
