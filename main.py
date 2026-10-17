@@ -13,14 +13,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 # ============================================================
-# NYRA CHESS API 0.7.0
-# - Speed & Smart: Transposition Table, Killer Moves
+# NYRA CHESS API 0.7.1
+# - Fix: Deploy hang on Render (startup event)
+# - Speed: Transposition Table, Killer Moves
 # - Optimized encode_board (loop-free)
-# - Zobrist Hashing for fast TT lookups
 # ============================================================
 
 SERVICE_NAME = "Nyra Chess API"
-VERSION = "0.7.0"
+VERSION = "0.7.1"
 
 MODEL_URL = os.getenv("MODEL_URL", "").strip()
 HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
@@ -137,6 +137,10 @@ def download_checkpoint():
 
 def load_model():
     global model, model_loaded, model_error, model_status
+    with model_lock:
+        model_status = "loading"
+        model_loaded = False
+        model_error = None
     try:
         download_checkpoint()
         checkpoint = torch.load(MODEL_PATH, map_location="cpu", weights_only=False)
@@ -144,16 +148,33 @@ def load_model():
         candidate = NyraNet().to(DEVICE)
         candidate.load_state_dict(state_dict, strict=True)
         candidate.eval()
+        with torch.inference_mode():
+            output = candidate(torch.zeros(1, 18, 8, 8, device=DEVICE))
+        if tuple(output.shape) != (1, 4096): raise RuntimeError(f"Unexpected output: {tuple(output.shape)}")
         with model_lock:
             model = candidate
             model_loaded = True
             model_status = "ready"
+            model_error = None
+        print("Nyra Chess model loaded successfully.")
     except Exception as exc:
         with model_lock:
+            model = None
+            model_loaded = False
             model_status = "error"
             model_error = f"{type(exc).__name__}: {exc}"
+        print(f"MODEL LOAD FAILED: {model_error}")
 
-threading.Thread(target=load_model, daemon=True).start()
+def start_model_loading():
+    global load_started
+    with model_lock:
+        if load_started: return
+        load_started = True
+    threading.Thread(target=load_model, daemon=True, name="nyra-model-loader").start()
+
+@app.on_event("startup")
+def startup_event():
+    start_model_loading()
 
 PIECE_TO_PLANE = {
     (chess.WHITE, chess.PAWN): 0, (chess.WHITE, chess.KNIGHT): 1, (chess.WHITE, chess.BISHOP): 2,
@@ -163,7 +184,6 @@ PIECE_TO_PLANE = {
 }
 
 def encode_board(board: chess.Board) -> torch.Tensor:
-    # TỐI ƯU HÓA: Dùng torch.zeros rồi gán trực tiếp vị trí thay vì loop 64 lần
     planes = torch.zeros((18, 8, 8), dtype=torch.float32)
     for pt in range(1, 7):
         for color in (chess.WHITE, chess.BLACK):
@@ -205,7 +225,6 @@ def evaluate_white_score(board: chess.Board) -> int:
         relative_rank = chess.square_rank(square) if piece.color == chess.WHITE else 7 - chess.square_rank(square)
         value = PIECE_VALUES[piece.piece_type]
 
-        # Treo quân
         is_attacked = board.is_attacked_by(not piece.color, square)
         is_defended = board.is_attacked_by(piece.color, square)
         if is_attacked and not is_defended and piece.piece_type != chess.KING:
@@ -297,7 +316,6 @@ def move_capture_value(board: chess.Board, move: chess.Move) -> int:
     attacker_value = PIECE_VALUES[attacker.piece_type] if attacker else 0
     return 10_000 + victim_value * 10 - attacker_value
 
-# KILLER MOVES: Lưu các nước đi "sát thủ" cắt tỉa được nhiều node
 killer_moves = [[] for _ in range(64)]
 
 def order_moves(board: chess.Board, moves, logits=None, ply=0):
@@ -310,9 +328,8 @@ def order_moves(board: chess.Board, moves, logits=None, ply=0):
         if move.promotion: score += 5_000 + PIECE_VALUES.get(move.promotion, 0)
         score += move_capture_value(board, move)
         
-        # Killer Move Heuristic
         if ply < 64 and move in killer_moves[ply]:
-            score += 900  # Ưu tiên cao dù không ăn quân
+            score += 900
 
         board.push(move)
         if board.is_check(): score += 100
@@ -365,7 +382,6 @@ def negamax(board, current_model, depth, alpha, beta, state, ply=0):
     if terminal is not None: return terminal
     if should_stop(state): return evaluate_board(board)
     
-    # TRANSITION TABLE LOOKUP
     z_hash = get_zobrist_hash(board)
     if z_hash in TT:
         tt_depth, tt_score = TT[z_hash]
@@ -377,7 +393,6 @@ def negamax(board, current_model, depth, alpha, beta, state, ply=0):
     moves = list(board.legal_moves)
     if not moves: return evaluate_board(board)
 
-    # Gọi Policy Logits ở Root, các tầng sâu dùng MVV-LVA / Killer
     if ply <= 1:
         logits = get_policy_logits(board, current_model)
         moves = order_moves(board, moves, logits, ply)
@@ -393,10 +408,8 @@ def negamax(board, current_model, depth, alpha, beta, state, ply=0):
         
         if score > best_score:
             best_score = score
-            
         alpha = max(alpha, score)
         
-        # Nếu điểm số >= beta (cắt tỉa), lưu Killer Move
         if alpha >= beta:
             if not board.is_capture(move) and ply < 64:
                 if move not in killer_moves[ply]:
@@ -404,11 +417,9 @@ def negamax(board, current_model, depth, alpha, beta, state, ply=0):
                     if len(killer_moves[ply]) > 2: killer_moves[ply].pop()
             break
 
-    # Lưu vào Transposition Table
     if len(TT) < TT_MAX_SIZE:
         TT[z_hash] = (depth, best_score)
     else:
-        # Nếu đầy thì xóa random để nhường chỗ
         TT.pop(next(iter(TT)))
 
     if best_score == -INF: return evaluate_board(board)
@@ -422,7 +433,6 @@ def search_best_move(board, current_model, allowed_moves=None):
 
     if not legal_moves: raise ValueError("No legal moves.")
     
-    # Xóa bộ nhớ đệm cũ trước khi tính
     TT.clear()
     for i in range(64): killer_moves[i].clear()
 
@@ -480,7 +490,7 @@ def search_best_move(board, current_model, allowed_moves=None):
         "elapsed_ms": int((time.monotonic() - started) * 1000),
         "aborted": state["aborted"],
         "score": None if best_score is None else int(best_score),
-        "method": "NyraNet v0.7.0 + TT + Killer",
+        "method": "NyraNet v0.7.1 + TT + Killer",
     }
 
 class MoveRequest(BaseModel):
@@ -530,3 +540,18 @@ def choose_move(request: MoveRequest):
         return {"uci": best_move.uci(), "san": board.san(best_move), "search": search_info}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Move search failed: {exc}")
+
+@app.get("/debug/predict")
+def debug_predict(fen: str):
+    with model_lock:
+        current_model, ready, current_error = model, model_loaded, model_error
+    if not ready or current_model is None: raise HTTPException(status_code=503, detail={"model_loaded": ready, "model_error": current_error})
+    try:
+        board = chess.Board(fen)
+        if not board.is_valid(): raise HTTPException(status_code=400, detail="Invalid FEN")
+        logits = get_policy_logits(board, current_model)
+        values, indices = torch.topk(logits, k=10)
+        predictions = [{"uci": chess.Move(idx//64, idx%64).uci(), "score": round(float(val), 5), "is_legal": chess.Move(idx//64, idx%64) in board.legal_moves} for val, idx in zip(values.tolist(), indices.tolist())]
+        legal_ranked = sorted(board.legal_moves, key=lambda m: float(logits[m.from_square * 64 + m.to_square].item()), reverse=True)[:10]
+        return {"model_loaded": True, "prediction_source": "NyraNet raw policy logits", "top_predictions": predictions, "top_legal_predictions": [{"uci": m.uci(), "san": board.san(m), "score": round(float(logits[m.from_square * 64 + m.to_square].item()), 5)} for m in legal_ranked]}
+    except Exception as exc: raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}")
