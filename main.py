@@ -13,13 +13,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 # ============================================================
-# NYRA CHESS API 0.6.0
-# - Fix: Thêm Opening Book (Khai cuộc chuẩn)
-# - Fix: Phạt quân bị treo (Hanging piece) & Vua hở sườn
+# NYRA CHESS API 0.6.1
+# - Fix syntax error
+# - Remove depth cap (allows SEARCH_DEPTH > 4)
+# - Opening Book, Hanging piece penalty, King safety
 # ============================================================
 
 SERVICE_NAME = "Nyra Chess API"
-VERSION = "0.6.0"
+VERSION = "0.6.1"
 
 MODEL_URL = os.getenv("MODEL_URL", "").strip()
 HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
@@ -28,9 +29,10 @@ MODEL_PATH = Path(os.getenv("MODEL_PATH", "/tmp/nyra_chess_best.pt"))
 DEVICE = torch.device("cpu")
 torch.set_num_threads(1)
 
-SEARCH_DEPTH = max(1,  int(os.getenv("SEARCH_DEPTH", "2"))))
-MAX_SEARCH_NODES = max(50, min(10000, int(os.getenv("MAX_SEARCH_NODES", "350"))))
-SEARCH_TIME_LIMIT = max(0.25, min(30.0, float(os.getenv("SEARCH_TIME_LIMIT", "3.0"))))
+# ĐÃ XÓA GIỚI HẠN MIN(4, ...) Ở DÒNG DƯỚI ĐÂY
+SEARCH_DEPTH = max(1, int(os.getenv("SEARCH_DEPTH", "2")))
+MAX_SEARCH_NODES = max(50, min(100000, int(os.getenv("MAX_SEARCH_NODES", "350"))))
+SEARCH_TIME_LIMIT = max(0.25, min(28.0, float(os.getenv("SEARCH_TIME_LIMIT", "3.0"))))
 QUIESCENCE_DEPTH = max(0, min(6, int(os.getenv("QUIESCENCE_DEPTH", "3"))))
 
 app = FastAPI(title=SERVICE_NAME, version=VERSION)
@@ -63,7 +65,6 @@ PIECE_VALUES = {
 }
 
 # --- SÁCH KHAI CUỘC (OPENING BOOK) ---
-# Các thế cờ đầu game (FEN) và nước đi tương ứng (UCI)
 OPENING_BOOK = {
     # 1. e4 e5 2. Nf3 Nc6 3. Bb5 (Ruy Lopez)
     "r1bqkbnr/pppp1ppp/2n5/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R b KQkq - 3 3": "a7a6",
@@ -238,22 +239,19 @@ def evaluate_white_score(board: chess.Board) -> int:
 
     endgame = phase <= 6
 
-    # 1. Đánh giá quân cờ & Phạt treo quân (Hanging Pieces)
     for square, piece in board.piece_map().items():
         sign = 1 if piece.color == chess.WHITE else -1
         file_idx = chess.square_file(square)
         relative_rank = chess.square_rank(square) if piece.color == chess.WHITE else 7 - chess.square_rank(square)
         value = PIECE_VALUES[piece.piece_type]
 
-        # Kiểm tra xem quân này có đang bị tấn công không
         is_attacked = board.is_attacked_by(not piece.color, square)
         is_defended = board.is_attacked_by(piece.color, square)
 
-        # Nếu bị tấn công mà không có ai bảo vệ (hoặc bị tấn công bởi quân rẻ hơn) -> Phạt nặng
         if is_attacked and not is_defended and piece.piece_type != chess.KING:
-            value -= int(PIECE_VALUES[piece.piece_type] * 0.8) # Phạt 80% giá trị quân
+            value -= int(PIECE_VALUES[piece.piece_type] * 0.8)
         elif is_attacked and not is_defended and piece.piece_type == chess.KING:
-            value -= 500 # Vua bị tấn công mà không có quân che chắn
+            value -= 500
 
         if piece.piece_type == chess.PAWN:
             value += relative_rank * 5
@@ -288,11 +286,9 @@ def evaluate_white_score(board: chess.Board) -> int:
 
         score += sign * value
 
-    # 2. Cặp Tượng
     for color in (chess.WHITE, chess.BLACK):
         if len(board.pieces(chess.BISHOP, color)) >= 2: score += 35 if color == chess.WHITE else -35
 
-    # 3. Phát triển quân
     if board.fullmove_number <= 12 and phase >= 10:
         for color in (chess.WHITE, chess.BLACK):
             sign = 1 if color == chess.WHITE else -1
@@ -303,7 +299,6 @@ def evaluate_white_score(board: chess.Board) -> int:
                     if chess.square_rank(sq) != home_rank: developed += 1
             score += sign * developed * 10
 
-    # 4. An toàn Vua & Lỗ hổng nhập thành
     for color in (chess.WHITE, chess.BLACK):
         sign = 1 if color == chess.WHITE else -1
         king_sq = board.king(color)
@@ -317,7 +312,6 @@ def evaluate_white_score(board: chess.Board) -> int:
 
         if castled: 
             score += sign * 70
-            # Phạt nếu Vua đã nhập thành nhưng bị mất Tốt che chắn phía trước (Lỗ hổng)
             direction = 1 if color == chess.WHITE else -1
             shield_pawns = 0
             for df in (-1, 0, 1):
@@ -325,7 +319,7 @@ def evaluate_white_score(board: chess.Board) -> int:
                 if 0 <= nf < 8 and 0 <= nr < 8:
                     p = board.piece_at(chess.square(nf, nr))
                     if p and p.color == color and p.piece_type == chess.PAWN: shield_pawns += 1
-            if shield_pawns == 0: score -= sign * 60 # Mất sạch tốt che chắn
+            if shield_pawns == 0: score -= sign * 60
             elif shield_pawns == 1: score -= sign * 30
 
         if not endgame and board.fullmove_number <= 20:
@@ -457,9 +451,7 @@ def search_best_move(board, current_model, allowed_moves=None):
 
     if not legal_moves: raise ValueError("No legal moves.")
     
-    # --- KIỂM TRA SÁCH KHAI CUỘC ---
     fen = board.fen()
-    # Lấy 4 trường đầu của FEN để so khớp (bỏ qua số nước đi)
     fen_parts = fen.split(" ")
     short_fen = " ".join(fen_parts[:4])
     
@@ -517,7 +509,7 @@ def search_best_move(board, current_model, allowed_moves=None):
         "elapsed_ms": int((time.monotonic() - started) * 1000),
         "aborted": state["aborted"],
         "score": None if best_score is None else int(best_score),
-        "method": "NyraNet + Eval v0.6.0 + Negamax",
+        "method": "NyraNet + Eval v0.6.1 + Negamax",
     }
 
 class MoveRequest(BaseModel):
