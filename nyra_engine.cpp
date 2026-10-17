@@ -88,9 +88,12 @@ int evaluate_board(const Board& board) {
             int val = pt_val;
 
             // Phạt quân bị treo (bị tấn công mà không được bảo vệ)
-            Square s = Square(sq);
-            bool is_attacked = board.isAttacked(s, ~piece.color());
+            Square s = static_cast<Square>(sq);
+            Color enemy = (piece.color() == Color::WHITE) ? Color::BLACK : Color::WHITE;
+            
+            bool is_attacked = board.isAttacked(s, enemy);
             bool is_defended = board.isAttacked(s, piece.color());
+            
             if (is_attacked && !is_defended && piece.type() != PieceType::KING) {
                 val -= pt_val * 0.8; // Phạt cực nặng
             }
@@ -105,9 +108,9 @@ int evaluate_board(const Board& board) {
                 val += (14 - 4 * dist);
             } else if (piece.type() == PieceType::KING) {
                 // Phạt Vua chưa nhập thành trong giai đoạn đầu
-                if (board.ply() < 30) {
-                    if (piece.color() == Color::WHITE && sq == Square::underlying::SQ_E1) val -= 50;
-                    if (piece.color() == Color::BLACK && sq == Square::underlying::SQ_E8) val -= 50;
+                if (board.fullMoveNumber() <= 15) {
+                    if (piece.color() == Color::WHITE && sq == 4) val -= 50; // E1
+                    if (piece.color() == Color::BLACK && sq == 60) val -= 50; // E8
                 }
             }
             score += sign * val;
@@ -201,11 +204,9 @@ int negamax(Board& board, int depth, int alpha, int beta, bool root = false) {
     for (int i = 0; i < moves.size(); i++) {
         board.makeMove(moves[i]);
         
-        // Check Extension: Nếu chiếu tướng, tăng thêm 1 độ sâu
         int extension = board.inCheck() ? 1 : 0;
         int score;
 
-        // PVS
         if (i == 0) {
             score = -negamax(board, depth - 1 + extension, -beta, -alpha);
         } else {
@@ -257,7 +258,7 @@ int main(int argc, char** argv) {
         
         int best_score = -INF;
         Move best_move = moves[0];
-        int SEARCH_DEPTH = 5; // Tăng lên 5 với TT và PVS
+        int SEARCH_DEPTH = 5; 
 
         for (int i = 0; i < moves.size(); i++) {
             board.makeMove(moves[i]);
