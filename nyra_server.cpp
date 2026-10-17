@@ -22,7 +22,6 @@ Ort::Session* session;
 const char* input_names[] = {"input"};
 const char* output_names[] = {"policy"};
 
-// --- OPENING BOOK ---
 std::unordered_map<std::string, std::string> opening_book = {
     {"r1bqkbnr/pppp1ppp/2n5/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R b KQkq -", "a7a6"},
     {"r1bqk1nr/pppp1ppp/2n5/2b1p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq -", "c2c3"},
@@ -31,18 +30,16 @@ std::unordered_map<std::string, std::string> opening_book = {
     {"rnbqkbnr/pppp1ppp/4p3/8/3PP3/8/PPP2PPP/RNBQKBNR b KQkq -", "d7d5"}
 };
 
-// --- ZOBRIST HASHING ---
 uint64_t zobrist_pieces[7][2][64];
 uint64_t zobrist_turn;
 enum TTFlag { EXACT, LOWERBOUND, UPPERBOUND };
 struct TTEntry { int depth; int score; TTFlag flag; Move best_move; };
 std::unordered_map<uint64_t, TTEntry> transposition_table;
 
-// --- BIẾN QUẢN LÝ THỜI GIAN ---
 std::chrono::steady_clock::time_point start_time;
 bool time_is_up = false;
-const int TIME_LIMIT_MS = 3500; // Tối đa 3.5 giây (An toàn tuyệt đối cho Render)
-const int MAX_DEPTH = 6;        // Cố gắng đạt Depth 6
+const int TIME_LIMIT_MS = 3000; 
+const int MAX_DEPTH = 5; // Hạ xuống 5 để đảm bảo an toàn và tập trung vào Eval
 
 void init_zobrist() {
     std::mt19937_64 rng(12345);
@@ -66,6 +63,7 @@ uint64_t get_hash(const Board& board) {
     return h;
 }
 
+// Hàm Eval nâng cao: Phạt cực nặng quân bị treo, thưởng phát triển quân
 int evaluate_board(const Board& board) {
     if (board.isGameOver().second == GameResult::LOSE) return -MATE_SCORE;
     if (board.isGameOver().second == GameResult::DRAW) return 0;
@@ -82,8 +80,10 @@ int evaluate_board(const Board& board) {
 
             Square s = static_cast<Square>(sq);
             Color enemy = (piece.color() == Color::WHITE) ? Color::BLACK : Color::WHITE;
+            
+            // Bảo vệ quân: Bị tấn công mà không có ai đỡ -> Trừ điểm cực nặng
             if (board.isAttacked(s, enemy) && !board.isAttacked(s, piece.color()) && piece.type() != PieceType::KING) {
-                val -= PIECE_VALUES[pt_idx] * 0.8; 
+                val -= PIECE_VALUES[pt_idx] * 0.9; 
             }
 
             if (piece.type() == PieceType::PAWN) {
@@ -93,6 +93,12 @@ int evaluate_board(const Board& board) {
                 if (piece.color() == Color::WHITE && rank > 0) val += 30;
                 if (piece.color() == Color::BLACK && rank < 7) val += 30;
                 val += (14 - 4 * dist);
+            } else if (piece.type() == PieceType::KING) {
+                // Phạt vua chưa nhập thành
+                if (board.fullMoveNumber() <= 15) {
+                    if (piece.color() == Color::WHITE && sq == 4) val -= 50; // E1
+                    if (piece.color() == Color::BLACK && sq == 60) val -= 50; // E8
+                }
             }
             score += sign * val;
         }
@@ -237,7 +243,6 @@ int main() {
 
     httplib::Server svr;
 
-    // Xử lý CORS Preflight
     svr.Options(R"(/.*)", [](const httplib::Request&, httplib::Response& res) {
         res.set_header("Access-Control-Allow-Origin", "*");
         res.set_header("Access-Control-Allow-Methods", "POST, OPTIONS");
@@ -248,7 +253,6 @@ int main() {
     svr.Post("/move", [](const httplib::Request& req, httplib::Response& res) {
         res.set_header("Access-Control-Allow-Origin", "*");
         
-        // Bọc Try-Catch để đảm bảo server không bao giờ bị crash
         try {
             std::string fen = extract_fen(req.body);
             if (fen.empty()) {
@@ -265,7 +269,6 @@ int main() {
                 res.set_content("{\"uci\":\"NONE\"}", "application/json"); return;
             }
 
-            // 1. Kiểm tra Opening Book
             if (opening_book.find(fen_short) != opening_book.end()) {
                 std::string book_move_uci = opening_book[fen_short];
                 for (int i = 0; i < moves.size(); i++) {
@@ -276,7 +279,6 @@ int main() {
                 }
             }
 
-            // 2. Khởi tạo tìm kiếm
             transposition_table.clear();
             transposition_table.reserve(100000); 
             order_moves_mvv_lva(board, moves);
@@ -288,7 +290,6 @@ int main() {
             time_is_up = false;
             start_time = std::chrono::steady_clock::now();
 
-            // 3. Iterative Deepening
             for (int depth = 1; depth <= MAX_DEPTH; depth++) {
                 if (time_is_up) break;
 
@@ -339,7 +340,6 @@ int main() {
                 }
             }
 
-            // 4. Trả kết quả
             auto t1 = std::chrono::steady_clock::now(); 
             int ms = (int)std::chrono::duration<double, std::milli>(t1 - start_time).count();
             
@@ -351,7 +351,6 @@ int main() {
             res.set_content(json_resp, "application/json");
             
         } catch (const std::exception& e) {
-            // Nếu có lỗi C++, trả về lỗi 500 thay vì sập server
             std::cerr << "Lỗi C++: " << e.what() << std::endl;
             res.status = 500;
             res.set_content("{\"error\":\"Internal Engine Error\"}", "application/json");
