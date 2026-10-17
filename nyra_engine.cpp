@@ -16,18 +16,26 @@ const int PIECE_VALUES[7] = {0, 100, 320, 330, 500, 900, 20000};
 const int MATE_SCORE = 100000;
 const int INF = 200000;
 
-// --- KHỞI TẠO ONNX & ZOBRIST HASHING (Dùng cho Transposition Table) ---
 Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "NyraNet");
 Ort::Session* session;
 const char* input_names[] = {"input"};
 const char* output_names[] = {"policy"};
 
+// --- ZOBRIST HASHING ---
 uint64_t zobrist_pieces[7][2][64];
 uint64_t zobrist_turn;
-std::unordered_map<uint64_t, std::pair<int, int>> transposition_table; // hash -> {depth, score}
+
+enum TTFlag { EXACT, LOWERBOUND, UPPERBOUND };
+struct TTEntry {
+    int depth;
+    int score;
+    TTFlag flag;
+    Move best_move;
+};
+std::unordered_map<uint64_t, TTEntry> transposition_table;
 
 void init_zobrist() {
-    std::mt19937_64 rng(12345); // Seed cố định
+    std::mt19937_64 rng(12345);
     for (int pt = 1; pt <= 6; pt++)
         for (int c = 0; c < 2; c++)
             for (int sq = 0; sq < 64; sq++)
@@ -64,7 +72,7 @@ void encode_board(const Board& board, std::vector<float>& tensor) {
     }
 }
 
-// --- HÀM ĐÁNH GIÁ (Có phạt quân bị treo) ---
+// --- HÀM ĐÁNH GIÁ NÂNG CAO ---
 int evaluate_board(const Board& board) {
     if (board.isGameOver().second == GameResult::LOSE) return -MATE_SCORE;
     if (board.isGameOver().second == GameResult::DRAW) return 0;
@@ -74,17 +82,33 @@ int evaluate_board(const Board& board) {
         Piece piece = board.at(sq);
         if (piece != Piece::NONE) {
             int sign = (piece.color() == Color::WHITE) ? 1 : -1;
-            int val = PIECE_VALUES[static_cast<int>(piece.type())];
+            int pt_val = PIECE_VALUES[static_cast<int>(piece.type())];
             int rank = sq / 8; int file = sq % 8;
             int dist = std::abs(3.5 - rank) + std::abs(3.5 - file);
-            
+            int val = pt_val;
+
+            // Phạt quân bị treo (bị tấn công mà không được bảo vệ)
+            Square s = Square(sq);
+            bool is_attacked = board.isAttacked(s, ~piece.color());
+            bool is_defended = board.isAttacked(s, piece.color());
+            if (is_attacked && !is_defended && piece.type() != PieceType::KING) {
+                val -= pt_val * 0.8; // Phạt cực nặng
+            }
+
             if (piece.type() == PieceType::PAWN) {
                 val += (14 - 4 * dist);
                 if (piece.color() == Color::WHITE) val += rank * 5; else val += (7 - rank) * 5;
             } else if (piece.type() == PieceType::KNIGHT || piece.type() == PieceType::BISHOP) {
-                if (piece.color() == Color::WHITE && rank > 0) val += 20;
-                if (piece.color() == Color::BLACK && rank < 7) val += 20;
+                // Thưởng phát triển quân
+                if (piece.color() == Color::WHITE && rank > 0) val += 30;
+                if (piece.color() == Color::BLACK && rank < 7) val += 30;
                 val += (14 - 4 * dist);
+            } else if (piece.type() == PieceType::KING) {
+                // Phạt Vua chưa nhập thành trong giai đoạn đầu
+                if (board.ply() < 30) {
+                    if (piece.color() == Color::WHITE && sq == Square::underlying::SQ_E1) val -= 50;
+                    if (piece.color() == Color::BLACK && sq == Square::underlying::SQ_E8) val -= 50;
+                }
             }
             score += sign * val;
         }
@@ -105,7 +129,6 @@ void order_moves_with_nn(Board& board, Movelist& moves) {
     std::vector<SM> sm;
     for (int i = 0; i < moves.size(); i++) {
         int idx = moves[i].from().index() * 64 + moves[i].to().index();
-        // NN score + Điểm thưởng cho nước ăn quân
         float s = logits[idx] + (board.isCapture(moves[i]) ? 1000.0f : 0.0f); 
         sm.push_back({moves[i], s});
     }
@@ -113,7 +136,6 @@ void order_moves_with_nn(Board& board, Movelist& moves) {
     for (int i = 0; i < moves.size(); i++) moves[i] = sm[i].m;
 }
 
-// Sắp xếp nước đi ở các tầng sâu (Chỉ ưu tiên ăn quân - MVV-LVA)
 void order_moves_mvv_lva(Board& board, Movelist& moves) {
     struct SM { Move m; int s; };
     std::vector<SM> sm;
@@ -122,7 +144,7 @@ void order_moves_mvv_lva(Board& board, Movelist& moves) {
         if (board.isCapture(moves[i])) {
             Piece victim = board.at(moves[i].to());
             if (victim != Piece::NONE) score = 10 * PIECE_VALUES[static_cast<int>(victim.type())] - PIECE_VALUES[static_cast<int>(board.at(moves[i].from()).type())];
-            else score = 1000; // En passant
+            else score = 1000;
         }
         sm.push_back({moves[i], score});
     }
@@ -130,19 +152,16 @@ void order_moves_mvv_lva(Board& board, Movelist& moves) {
     for (int i = 0; i < moves.size(); i++) moves[i] = sm[i].m;
 }
 
-// --- QUIESCENCE SEARCH (Chỉ xét ăn quân/chiếu tướng để tránh bị lừa) ---
 int quiescence(Board& board, int alpha, int beta) {
     int stand_pat = evaluate_board(board);
     if (stand_pat >= beta) return beta;
     if (alpha < stand_pat) alpha = stand_pat;
 
     Movelist moves; movegen::legalmoves(moves, board);
-    // Chỉ xét các nước ăn quân
     Movelist capture_moves;
     for(int i=0; i<moves.size(); i++) {
         if(board.isCapture(moves[i])) capture_moves.add(moves[i]);
     }
-
     order_moves_mvv_lva(board, capture_moves);
 
     for (int i = 0; i < capture_moves.size(); i++) {
@@ -155,44 +174,63 @@ int quiescence(Board& board, int alpha, int beta) {
     return alpha;
 }
 
-// --- ALPHA-BETA VỚI TRANSPOSITION TABLE ---
 int negamax(Board& board, int depth, int alpha, int beta, bool root = false) {
-    if (depth == 0) return quiescence(board, alpha, beta);
-
     uint64_t hash = get_hash(board);
     if (transposition_table.find(hash) != transposition_table.end()) {
-        auto entry = transposition_table[hash];
-        if (entry.first >= depth) return entry.second;
+        TTEntry entry = transposition_table[hash];
+        if (entry.depth >= depth) {
+            if (entry.flag == EXACT) return entry.score;
+            else if (entry.flag == LOWERBOUND && entry.score > alpha) alpha = entry.score;
+            else if (entry.flag == UPPERBOUND && entry.score < beta) beta = entry.score;
+            if (alpha >= beta) return entry.score;
+        }
     }
+
+    if (depth == 0) return quiescence(board, alpha, beta);
 
     Movelist moves; movegen::legalmoves(moves, board);
     if (moves.size() == 0) return board.inCheck() ? -MATE_SCORE + depth : 0;
     
-    // Ở gốc dùng NN, các tầng sau dùng MVV-LVA
     if (root) order_moves_with_nn(board, moves);
     else order_moves_mvv_lva(board, moves);
     
     int best = -INF;
+    Move best_move_in_node = moves[0];
+    TTFlag flag = UPPERBOUND;
+
     for (int i = 0; i < moves.size(); i++) {
         board.makeMove(moves[i]);
-        // PVS (Principal Variation Search) để tăng tốc
+        
+        // Check Extension: Nếu chiếu tướng, tăng thêm 1 độ sâu
+        int extension = board.inCheck() ? 1 : 0;
         int score;
+
+        // PVS
         if (i == 0) {
-            score = -negamax(board, depth - 1, -beta, -alpha);
+            score = -negamax(board, depth - 1 + extension, -beta, -alpha);
         } else {
-            score = -negamax(board, depth - 1, -alpha - 1, -alpha);
+            score = -negamax(board, depth - 1 + extension, -alpha - 1, -alpha);
             if (score > alpha && score < beta) {
-                score = -negamax(board, depth - 1, -beta, -alpha);
+                score = -negamax(board, depth - 1 + extension, -beta, -alpha);
             }
         }
         board.unmakeMove(moves[i]);
         
-        if (score > best) best = score;
-        if (score > alpha) alpha = score;
-        if (alpha >= beta) break; // Cắt tỉa Beta
+        if (score > best) {
+            best = score;
+            best_move_in_node = moves[i];
+        }
+        if (score > alpha) {
+            alpha = score;
+            flag = EXACT;
+        }
+        if (alpha >= beta) {
+            flag = LOWERBOUND;
+            break;
+        }
     }
 
-    transposition_table[hash] = {depth, best};
+    transposition_table[hash] = {depth, best, flag, best_move_in_node};
     return best;
 }
 
@@ -219,9 +257,7 @@ int main(int argc, char** argv) {
         
         int best_score = -INF;
         Move best_move = moves[0];
-
-        // TĂNG DEPTH LÊN 5
-        int SEARCH_DEPTH = 5;
+        int SEARCH_DEPTH = 5; // Tăng lên 5 với TT và PVS
 
         for (int i = 0; i < moves.size(); i++) {
             board.makeMove(moves[i]);
