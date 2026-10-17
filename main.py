@@ -12,22 +12,16 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-
 # ============================================================
-# NYRA CHESS API 0.5.0
-# - Fix: Nhập thành & Bắt tốt qua đường (từ 0.4.1)
-# - Upgrade: Nâng cấp Evaluation Function (Bishop pair, Outpost,
-#   Isolated pawns, King attack, Rook open file)
+# NYRA CHESS API 0.5.1 (Fixed Knight Outpost Bug)
 # ============================================================
 
 SERVICE_NAME = "Nyra Chess API"
-VERSION = "0.5.0"
+VERSION = "0.5.1"
 
 MODEL_URL = os.getenv("MODEL_URL", "").strip()
 HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
-MODEL_PATH = Path(
-    os.getenv("MODEL_PATH", "/tmp/nyra_chess_best.pt")
-)
+MODEL_PATH = Path(os.getenv("MODEL_PATH", "/tmp/nyra_chess_best.pt"))
 
 DEVICE = torch.device("cpu")
 torch.set_num_threads(1)
@@ -66,10 +60,6 @@ PIECE_VALUES = {
     chess.KING: 0,
 }
 
-# ============================================================
-# MODEL ARCHITECTURE
-# ============================================================
-
 class ResidualBlock(nn.Module):
     def __init__(self, channels: int = 64):
         super().__init__()
@@ -84,7 +74,6 @@ class ResidualBlock(nn.Module):
 
     def forward(self, x):
         return self.relu(x + self.net(x))
-
 
 class NyraNet(nn.Module):
     def __init__(self):
@@ -107,11 +96,6 @@ class NyraNet(nn.Module):
         for block in self.blocks:
             x = block(x)
         return self.policy(x)
-
-
-# ============================================================
-# CHECKPOINT DOWNLOAD & LOADING
-# ============================================================
 
 def download_checkpoint():
     if MODEL_PATH.is_file() and MODEL_PATH.stat().st_size > 0:
@@ -192,11 +176,6 @@ def start_model_loading():
 def startup_event():
     start_model_loading()
 
-
-# ============================================================
-# BOARD ENCODING
-# ============================================================
-
 PIECE_TO_PLANE = {
     (chess.WHITE, chess.PAWN): 0, (chess.WHITE, chess.KNIGHT): 1,
     (chess.WHITE, chess.BISHOP): 2, (chess.WHITE, chess.ROOK): 3,
@@ -220,11 +199,6 @@ def encode_board(board: chess.Board) -> torch.Tensor:
         planes[17, chess.square_rank(board.ep_square), chess.square_file(board.ep_square)] = 1.0
     return planes.unsqueeze(0)
 
-
-# ============================================================
-# EVALUATION & HEURISTICS (UPGRADED v0.5.0)
-# ============================================================
-
 def terminal_score(board: chess.Board, ply: int):
     if board.is_checkmate(): return -MATE_SCORE + ply
     if (board.is_stalemate() or board.is_insufficient_material() or 
@@ -246,7 +220,6 @@ def evaluate_white_score(board: chess.Board) -> int:
 
     endgame = phase <= 6
 
-    # --- 1. Piece Values & Specific Piece Positions ---
     for square, piece in board.piece_map().items():
         sign = 1 if piece.color == chess.WHITE else -1
         file_idx = chess.square_file(square)
@@ -258,7 +231,6 @@ def evaluate_white_score(board: chess.Board) -> int:
             value += relative_rank * 5
             if file_idx in (3, 4): value += 5
             
-            # Passed pawn
             enemy_pawns = board.pieces(chess.PAWN, not piece.color)
             same_or_adjacent = [f for f in (file_idx - 1, file_idx, file_idx + 1) if 0 <= f < 8]
             blocked = False
@@ -270,40 +242,35 @@ def evaluate_white_score(board: chess.Board) -> int:
                     break
             if not blocked: value += 8 + relative_rank * relative_rank * 2
 
-            # Isolated pawn
             own_pawns = board.pieces(chess.PAWN, piece.color)
             has_adjacent = any(chess.square_file(sq) in (file_idx - 1, file_idx + 1) for sq in own_pawns)
             if not has_adjacent: value -= 15
 
         elif piece.piece_type == chess.KNIGHT:
             value += center_bonus(square)
-            # Knight Outpost (protected by pawn on rank 4-6)
             if 2 <= relative_rank <= 5:
-                # Check if protected by our pawn
                 if board.attackers(piece.color, square):
-                    if any(p.piece_type == chess.PAWN for p in board.attackers(piece.color, square)):
+                    # FIX LỖI Ở ĐÂY: Phải lấy quân cờ tại ô đó (board.piece_at), không phải ô cờ (p)
+                    if any(board.piece_at(p).piece_type == chess.PAWN for p in board.attackers(piece.color, square)):
                         value += 25
 
         elif piece.piece_type == chess.BISHOP:
             value += center_bonus(square) // 2
         elif piece.piece_type == chess.ROOK:
-            # Rook on open file
             own_pawns = board.pieces(chess.PAWN, piece.color)
             enemy_pawns = board.pieces(chess.PAWN, not piece.color)
             if not any(chess.square_file(s) == file_idx for s in own_pawns):
                 value += 20 if not any(chess.square_file(s) == file_idx for s in enemy_pawns) else 10
-            if relative_rank == 6: value += 15 # 7th rank rook
+            if relative_rank == 6: value += 15
         elif piece.piece_type == chess.QUEEN:
             if board.fullmove_number <= 10: value -= 8
 
         score += sign * value
 
-    # --- 2. Bishop Pair ---
     for color in (chess.WHITE, chess.BLACK):
         if len(board.pieces(chess.BISHOP, color)) >= 2:
             score += 35 if color == chess.WHITE else -35
 
-    # --- 3. Development (Opening) ---
     if board.fullmove_number <= 12 and phase >= 10:
         for color in (chess.WHITE, chess.BLACK):
             sign = 1 if color == chess.WHITE else -1
@@ -314,7 +281,6 @@ def evaluate_white_score(board: chess.Board) -> int:
                     if chess.square_rank(sq) != home_rank: developed += 1
             score += sign * developed * 10
 
-    # --- 4. King Safety & King Attack ---
     for color in (chess.WHITE, chess.BLACK):
         sign = 1 if color == chess.WHITE else -1
         king_sq = board.king(color)
@@ -332,7 +298,6 @@ def evaluate_white_score(board: chess.Board) -> int:
             if kr != home_rank and not castled: score -= sign * 45
 
         if not endgame:
-            # Pawn shield
             direction = 1 if color == chess.WHITE else -1
             shield = 0
             for df in (-1, 0, 1):
@@ -344,11 +309,9 @@ def evaluate_white_score(board: chess.Board) -> int:
 
             if kf in (3, 4) and board.fullmove_number > 8: score -= sign * 20
 
-            # King Attackers (Địch tấn công vua)
             attackers = board.attackers(not color, king_sq)
             score -= sign * min(3, len(attackers)) * 14
             
-            # Địch tấn công các ô xung quanh vua
             zone_attacks = 0
             for df in (-1, 0, 1):
                 for dr in (-1, 0, 1):
@@ -362,7 +325,6 @@ def evaluate_white_score(board: chess.Board) -> int:
         else:
             score += sign * center_bonus(king_sq)
 
-    # --- 5. Doubled Pawns ---
     for color in (chess.WHITE, chess.BLACK):
         sign = 1 if color == chess.WHITE else -1
         pawns = board.pieces(chess.PAWN, color)
@@ -379,11 +341,6 @@ def evaluate_board(board: chess.Board) -> int:
     if terminal is not None: return terminal
     score = evaluate_white_score(board)
     return score if board.turn == chess.WHITE else -score
-
-
-# ============================================================
-# MOVE ORDERING & SEARCH
-# ============================================================
 
 def get_policy_logits(board: chess.Board, current_model):
     x = encode_board(board).to(DEVICE)
@@ -540,13 +497,8 @@ def search_best_move(board, current_model, allowed_moves=None):
         "elapsed_ms": int((time.monotonic() - started) * 1000),
         "aborted": state["aborted"],
         "score": None if best_score is None else int(best_score),
-        "method": "NyraNet + Eval v0.5.0 + Negamax",
+        "method": "NyraNet + Eval v0.5.1 + Negamax",
     }
-
-
-# ============================================================
-# API ENDPOINTS
-# ============================================================
 
 class MoveRequest(BaseModel):
     fen: str
