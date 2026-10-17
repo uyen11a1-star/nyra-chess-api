@@ -16,6 +16,69 @@ const int PIECE_VALUES[7] = {0, 100, 320, 330, 500, 900, 20000};
 const int MATE_SCORE = 100000;
 const int INF = 200000;
 
+// --- PIECE SQUARE TABLES (PST) - Dạy AI biết vị trí quân cờ tốt ---
+// Dành cho quân Trắng, quân Đen sẽ lật ngược lại
+const int PAWN_PST[64] = {
+    0,  0,  0,  0,  0,  0,  0,  0,
+    50, 50, 50, 50, 50, 50, 50, 50,
+    10, 10, 20, 30, 30, 20, 10, 10,
+     5,  5, 10, 25, 25, 10,  5,  5,
+     0,  0,  0, 20, 20,  0,  0,  0,
+     5, -5,-10,  0,  0,-10, -5,  5,
+     5, 10, 10,-20,-20, 10, 10,  5,
+     0,  0,  0,  0,  0,  0,  0,  0
+};
+const int KNIGHT_PST[64] = {
+    -50,-40,-30,-30,-30,-30,-40,-50,
+    -40,-20,  0,  0,  0,  0,-20,-40,
+    -30,  0, 10, 15, 15, 10,  0,-30,
+    -30,  5, 15, 20, 20, 15,  5,-30,
+    -30,  0, 15, 20, 20, 15,  0,-30,
+    -30,  5, 10, 15, 15, 10,  5,-30,
+    -40,-20,  0,  5,  5,  0,-20,-40,
+    -50,-40,-30,-30,-30,-30,-40,-50
+};
+const int BISHOP_PST[64] = {
+    -20,-10,-10,-10,-10,-10,-10,-20,
+    -10,  0,  0,  0,  0,  0,  0,-10,
+    -10,  0,  5, 10, 10,  5,  0,-10,
+    -10,  5,  5, 10, 10,  5,  5,-10,
+    -10,  0, 10, 10, 10, 10,  0,-10,
+    -10, 10, 10, 10, 10, 10, 10,-10,
+    -10,  5,  0,  0,  0,  0,  5,-10,
+    -20,-10,-10,-10,-10,-10,-10,-20
+};
+const int ROOK_PST[64] = {
+      0,  0,  0,  0,  0,  0,  0,  0,
+      5, 10, 10, 10, 10, 10, 10,  5,
+     -5,  0,  0,  0,  0,  0,  0, -5,
+     -5,  0,  0,  0,  0,  0,  0, -5,
+     -5,  0,  0,  0,  0,  0,  0, -5,
+     -5,  0,  0,  0,  0,  0,  0, -5,
+     -5,  0,  0,  0,  0,  0,  0, -5,
+      0,  0,  0,  5,  5,  0,  0,  0
+};
+const int QUEEN_PST[64] = {
+    -20,-10,-10, -5, -5,-10,-10,-20,
+    -10,  0,  0,  0,  0,  0,  0,-10,
+    -10,  0,  5,  5,  5,  5,  0,-10,
+     -5,  0,  5,  5,  5,  5,  0, -5,
+      0,  0,  5,  5,  5,  5,  0, -5,
+    -10,  5,  5,  5,  5,  5,  0,-10,
+    -10,  0,  5,  0,  0,  0,  0,-10,
+    -20,-10,-10, -5, -5,-10,-10,-20
+};
+const int KING_MID_PST[64] = {
+    -30,-40,-40,-50,-50,-40,-40,-30,
+    -30,-40,-40,-50,-50,-40,-40,-30,
+    -30,-40,-40,-50,-50,-40,-40,-30,
+    -30,-40,-40,-50,-50,-40,-40,-30,
+    -20,-30,-30,-40,-40,-30,-30,-20,
+    -10,-20,-20,-20,-20,-20,-20,-10,
+     20, 20,  0,  0,  0,  0, 20, 20,
+     20, 30, 10,  0,  0, 10, 30, 20
+};
+
 Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "NyraNet");
 Ort::Session* session;
 const char* input_names[] = {"input"};
@@ -24,14 +87,8 @@ const char* output_names[] = {"policy"};
 // --- ZOBRIST HASHING ---
 uint64_t zobrist_pieces[7][2][64];
 uint64_t zobrist_turn;
-
 enum TTFlag { EXACT, LOWERBOUND, UPPERBOUND };
-struct TTEntry {
-    int depth;
-    int score;
-    TTFlag flag;
-    Move best_move;
-};
+struct TTEntry { int depth; int score; TTFlag flag; Move best_move; };
 std::unordered_map<uint64_t, TTEntry> transposition_table;
 
 void init_zobrist() {
@@ -56,6 +113,7 @@ uint64_t get_hash(const Board& board) {
     return h;
 }
 
+// --- MÃ HÓA ĐẦY ĐỦ 18 PLANES (Khắc phục lỗi mạng Neural) ---
 void encode_board(const Board& board, std::vector<float>& tensor) {
     std::fill(tensor.begin(), tensor.end(), 0.0f);
     for (int sq = 0; sq < 64; sq++) {
@@ -70,9 +128,26 @@ void encode_board(const Board& board, std::vector<float>& tensor) {
     if (board.sideToMove() == Color::WHITE) {
         for (int i = 0; i < 64; i++) tensor[12 * 64 + i] = 1.0f;
     }
+    // Cập nhật đầy đủ Plane 13-17
+    if (board.castlingRights().has(CastlingRights::Side::KING_SIDE, Color::WHITE)) {
+        for (int i = 0; i < 64; i++) tensor[13 * 64 + i] = 1.0f;
+    }
+    if (board.castlingRights().has(CastlingRights::Side::QUEEN_SIDE, Color::WHITE)) {
+        for (int i = 0; i < 64; i++) tensor[14 * 64 + i] = 1.0f;
+    }
+    if (board.castlingRights().has(CastlingRights::Side::KING_SIDE, Color::BLACK)) {
+        for (int i = 0; i < 64; i++) tensor[15 * 64 + i] = 1.0f;
+    }
+    if (board.castlingRights().has(CastlingRights::Side::QUEEN_SIDE, Color::BLACK)) {
+        for (int i = 0; i < 64; i++) tensor[16 * 64 + i] = 1.0f;
+    }
+    if (board.enpassantSq() != Square::underlying::NO_SQ) {
+        int ep = board.enpassantSq().index();
+        tensor[17 * 64 + ep] = 1.0f;
+    }
 }
 
-// --- HÀM ĐÁNH GIÁ NÂNG CAO ---
+// --- HÀM ĐÁNH GIÁ CÓ BẢNG ĐIỂM VỊ TRÍ (PST) ---
 int evaluate_board(const Board& board) {
     if (board.isGameOver().second == GameResult::LOSE) return -MATE_SCORE;
     if (board.isGameOver().second == GameResult::DRAW) return 0;
@@ -82,36 +157,23 @@ int evaluate_board(const Board& board) {
         Piece piece = board.at(sq);
         if (piece != Piece::NONE) {
             int sign = (piece.color() == Color::WHITE) ? 1 : -1;
-            int pt_val = PIECE_VALUES[static_cast<int>(piece.type())];
-            int rank = sq / 8; int file = sq % 8;
-            int dist = std::abs(3.5 - rank) + std::abs(3.5 - file);
-            int val = pt_val;
+            int pt_idx = static_cast<int>(piece.type());
+            int val = PIECE_VALUES[pt_idx];
+            int pst_sq = (piece.color() == Color::WHITE) ? sq : (sq ^ 56); // Lật ngược bàn cờ cho Đen
 
-            // Phạt quân bị treo (bị tấn công mà không được bảo vệ)
+            // Cộng điểm từ Bảng PST
+            if (piece.type() == PieceType::PAWN) val += PAWN_PST[pst_sq];
+            else if (piece.type() == PieceType::KNIGHT) val += KNIGHT_PST[pst_sq];
+            else if (piece.type() == PieceType::BISHOP) val += BISHOP_PST[pst_sq];
+            else if (piece.type() == PieceType::ROOK) val += ROOK_PST[pst_sq];
+            else if (piece.type() == PieceType::QUEEN) val += QUEEN_PST[pst_sq];
+            else if (piece.type() == PieceType::KING) val += KING_MID_PST[pst_sq];
+
+            // Phạt quân bị treo
             Square s = static_cast<Square>(sq);
             Color enemy = (piece.color() == Color::WHITE) ? Color::BLACK : Color::WHITE;
-            
-            bool is_attacked = board.isAttacked(s, enemy);
-            bool is_defended = board.isAttacked(s, piece.color());
-            
-            if (is_attacked && !is_defended && piece.type() != PieceType::KING) {
-                val -= pt_val * 0.8; // Phạt cực nặng
-            }
-
-            if (piece.type() == PieceType::PAWN) {
-                val += (14 - 4 * dist);
-                if (piece.color() == Color::WHITE) val += rank * 5; else val += (7 - rank) * 5;
-            } else if (piece.type() == PieceType::KNIGHT || piece.type() == PieceType::BISHOP) {
-                // Thưởng phát triển quân
-                if (piece.color() == Color::WHITE && rank > 0) val += 30;
-                if (piece.color() == Color::BLACK && rank < 7) val += 30;
-                val += (14 - 4 * dist);
-            } else if (piece.type() == PieceType::KING) {
-                // Phạt Vua chưa nhập thành trong giai đoạn đầu
-                if (board.fullMoveNumber() <= 15) {
-                    if (piece.color() == Color::WHITE && sq == 4) val -= 50; // E1
-                    if (piece.color() == Color::BLACK && sq == 60) val -= 50; // E8
-                }
+            if (board.isAttacked(s, enemy) && !board.isAttacked(s, piece.color()) && piece.type() != PieceType::KING) {
+                val -= PIECE_VALUES[pt_idx] * 0.8; 
             }
             score += sign * val;
         }
@@ -203,7 +265,6 @@ int negamax(Board& board, int depth, int alpha, int beta, bool root = false) {
 
     for (int i = 0; i < moves.size(); i++) {
         board.makeMove(moves[i]);
-        
         int extension = board.inCheck() ? 1 : 0;
         int score;
 
@@ -231,7 +292,11 @@ int negamax(Board& board, int depth, int alpha, int beta, bool root = false) {
         }
     }
 
-    transposition_table[hash] = {depth, best, flag, best_move_in_node};
+    // Ghi đè vào TT (Luôn ưu tiên độ sâu lớn hơn)
+    if (transposition_table.find(hash) == transposition_table.end() || transposition_table[hash].depth <= depth) {
+        transposition_table[hash] = {depth, best, flag, best_move_in_node};
+    }
+    
     return best;
 }
 
