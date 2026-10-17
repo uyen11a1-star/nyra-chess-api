@@ -112,7 +112,7 @@ uint64_t get_hash(const Board& board) {
     return h;
 }
 
-// --- MÃ HÓA ĐẦY ĐỦ 18 PLANES (Đã sửa cú pháp castling) ---
+// --- MÃ HÓA ĐƠN GIẢN (Bỏ qua quyền nhập thành) ---
 void encode_board(const Board& board, std::vector<float>& tensor) {
     std::fill(tensor.begin(), tensor.end(), 0.0f);
     for (int sq = 0; sq < 64; sq++) {
@@ -127,26 +127,7 @@ void encode_board(const Board& board, std::vector<float>& tensor) {
     if (board.sideToMove() == Color::WHITE) {
         for (int i = 0; i < 64; i++) tensor[12 * 64 + i] = 1.0f;
     }
-    
-    // Sử dụng cú pháp mới của thư viện chess.hpp
-    CastlingRights rights = board.castlingRights();
-    if (rights & CastlingRights::WhiteKingSide) {
-        for (int i = 0; i < 64; i++) tensor[13 * 64 + i] = 1.0f;
-    }
-    if (rights & CastlingRights::WhiteQueenSide) {
-        for (int i = 0; i < 64; i++) tensor[14 * 64 + i] = 1.0f;
-    }
-    if (rights & CastlingRights::BlackKingSide) {
-        for (int i = 0; i < 64; i++) tensor[15 * 64 + i] = 1.0f;
-    }
-    if (rights & CastlingRights::BlackQueenSide) {
-        for (int i = 0; i < 64; i++) tensor[16 * 64 + i] = 1.0f;
-    }
-    
-    if (board.enpassantSq() != Square::underlying::NO_SQ) {
-        int ep = board.enpassantSq().index();
-        tensor[17 * 64 + ep] = 1.0f;
-    }
+    // Tạm thời bỏ qua plane 13-17 (castling, en passant)
 }
 
 // --- HÀM ĐÁNH GIÁ CÓ BẢNG ĐIỂM VỊ TRÍ (PST) ---
