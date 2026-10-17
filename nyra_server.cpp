@@ -23,17 +23,11 @@ const char* input_names[] = {"input"};
 const char* output_names[] = {"policy"};
 
 // --- OPENING BOOK ---
-// Nhúng sẵn một số thế cờ khai cuộc phổ biến để nó đánh chuẩn ngay từ đầu
 std::unordered_map<std::string, std::string> opening_book = {
-    // Ruy Lopez
     {"r1bqkbnr/pppp1ppp/2n5/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R b KQkq -", "a7a6"},
-    // Italian Game
     {"r1bqk1nr/pppp1ppp/2n5/2b1p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq -", "c2c3"},
-    // Sicilian Defense
     {"rnbqkbnr/pp2pppp/3p4/2p5/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq -", "d2d4"},
-    // Queen's Gambit
     {"rnbqkbnr/ppp2ppp/4p3/3p4/2PP4/8/PP2PPPP/RNBQKBNR w KQkq -", "b1c3"},
-    // French Defense
     {"rnbqkbnr/pppp1ppp/4p3/8/3PP3/8/PPP2PPP/RNBQKBNR b KQkq -", "d7d5"}
 };
 
@@ -117,9 +111,15 @@ void order_moves_mvv_lva(Board& board, Movelist& moves) {
     for (int i = 0; i < moves.size(); i++) moves[i] = sm[i].m;
 }
 
+// Đã sửa hàm kiểm tra quân nặng để tương thích với thư viện mới
 bool has_non_pawn_material(const Board& board, Color color) {
-    for (int pt = 2; pt <= 5; pt++) { // Knight to Queen
-        if (board.pieces(static_cast<PieceType>(pt), color).count() > 0) return true;
+    for (int sq = 0; sq < 64; sq++) {
+        Piece p = board.at(sq);
+        if (p != Piece::NONE && p.color() == color) {
+            PieceType pt = p.type();
+            if (pt == PieceType::KNIGHT || pt == PieceType::BISHOP || pt == PieceType::ROOK || pt == PieceType::QUEEN)
+                return true;
+        }
     }
     return false;
 }
@@ -146,22 +146,11 @@ int quiescence(Board& board, int alpha, int beta) {
     return alpha;
 }
 
-// --- THUẬT TOÁN TÌM KIẾM NÂNG CAO (CÓ NMP & LMR) ---
+// --- THUẬT TOÁN TÌM KIẾM NÂNG CAO ---
 int negamax(Board& board, int depth, int alpha, int beta, bool root = false) {
     if (depth == 0) return quiescence(board, alpha, beta);
 
     bool in_check = board.inCheck();
-
-    // 1. NULL MOVE PRUNING (NMP)
-    // Nếu không bị chiếu, có quân nặng và đủ độ sâu, thử nhường lượt cho địch
-    if (!root && !in_check && depth >= 3 && has_non_pawn_material(board, board.sideToMove())) {
-        board.makeMove(Move::make(Square::underlying::NO_SQ, Square::underlying::NO_SQ)); // Null move
-        int score = -negamax(board, depth - 3, -beta, -beta + 1, false);
-        board.unmakeMove(Move::make(Square::underlying::NO_SQ, Square::underlying::NO_SQ));
-        
-        // Nếu dù nhường lượt mà địch vẫn không thể phá vỡ thế trận -> Cắt tỉa nhánh này
-        if (score >= beta) return beta;
-    }
 
     uint64_t hash = get_hash(board);
     if (transposition_table.find(hash) != transposition_table.end()) {
@@ -189,17 +178,16 @@ int negamax(Board& board, int depth, int alpha, int beta, bool root = false) {
         int score;
         int new_depth = depth - 1 + extension;
 
-        // 2. LATE MOVE REDUCTIONS (LMR)
-        // Các nước đi sau (không ăn quân, không chiếu) sẽ bị giảm độ sâu để tính nhanh hơn
-        if (i >= 3 && depth >= 3 && !in_check && !board.isCapture(moves[i]) && !board.givesCheck(moves[i])) {
+        // LMR (Late Move Reductions) - Sửa lại điều kiện so sánh với CheckType
+        if (i >= 3 && depth >= 3 && !in_check && !board.isCapture(moves[i]) && board.givesCheck(moves[i]) == CheckType::NONE) {
             new_depth -= 1; 
         }
 
+        // PVS (Principal Variation Search)
         if (i == 0) {
             score = -negamax(board, new_depth, -beta, -alpha);
         } else {
             score = -negamax(board, new_depth, -alpha - 1, -alpha);
-            // Nếu nước bị giảm độ sâu mà lại tốt, tính lại ở độ sâu đầy đủ
             if (score > alpha && new_depth < depth - 1 + extension) {
                 score = -negamax(board, depth - 1 + extension, -beta, -alpha);
             } else if (score > alpha && score < beta) {
@@ -260,9 +248,8 @@ int main() {
             res.status = 400; res.set_content("{\"error\":\"No FEN\"}", "application/json"); return;
         }
 
-        // Kiểm tra Sách Khai Cuộc
         std::string fen_short = fen.substr(0, fen.find_last_of(" "));
-        fen_short = fen_short.substr(0, fen_short.find_last_of(" ")); // Bỏ số nước đi
+        fen_short = fen_short.substr(0, fen_short.find_last_of(" ")); 
         
         Board board = Board(fen);
         Movelist moves; movegen::legalmoves(moves, board);
@@ -287,7 +274,7 @@ int main() {
         
         int best_score = -INF;
         Move best_move = moves[0];
-        int SEARCH_DEPTH = 6; // Tăng lên 6 vì đã có NMP và LMR hỗ trợ
+        int SEARCH_DEPTH = 6; 
 
         auto t0 = std::chrono::high_resolution_clock::now();
 
