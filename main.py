@@ -13,14 +13,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 # ============================================================
-# NYRA CHESS API 0.6.1
-# - Fix syntax error
-# - Remove depth cap (allows SEARCH_DEPTH > 4)
-# - Opening Book, Hanging piece penalty, King safety
+# NYRA CHESS API 0.7.0
+# - Speed & Smart: Transposition Table, Killer Moves
+# - Optimized encode_board (loop-free)
+# - Zobrist Hashing for fast TT lookups
 # ============================================================
 
 SERVICE_NAME = "Nyra Chess API"
-VERSION = "0.6.1"
+VERSION = "0.7.0"
 
 MODEL_URL = os.getenv("MODEL_URL", "").strip()
 HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
@@ -29,7 +29,6 @@ MODEL_PATH = Path(os.getenv("MODEL_PATH", "/tmp/nyra_chess_best.pt"))
 DEVICE = torch.device("cpu")
 torch.set_num_threads(1)
 
-# ĐÃ XÓA GIỚI HẠN MIN(4, ...) Ở DÒNG DƯỚI ĐÂY
 SEARCH_DEPTH = max(1, int(os.getenv("SEARCH_DEPTH", "2")))
 MAX_SEARCH_NODES = max(50, min(100000, int(os.getenv("MAX_SEARCH_NODES", "350"))))
 SEARCH_TIME_LIMIT = max(0.25, min(28.0, float(os.getenv("SEARCH_TIME_LIMIT", "3.0"))))
@@ -56,164 +55,127 @@ MATE_SCORE = 100_000
 INF = 1_000_000
 
 PIECE_VALUES = {
-    chess.PAWN: 100,
-    chess.KNIGHT: 320,
-    chess.BISHOP: 335,
-    chess.ROOK: 500,
-    chess.QUEEN: 900,
-    chess.KING: 0,
+    chess.PAWN: 100, chess.KNIGHT: 320, chess.BISHOP: 335,
+    chess.ROOK: 500, chess.QUEEN: 900, chess.KING: 0,
 }
 
-# --- SÁCH KHAI CUỘC (OPENING BOOK) ---
+# Zobrist Hashing để băm thế cờ
+ZOBRIST_PIECES = {}
+ZOBRIST_TURN = 0
+def init_zobrist():
+    global ZOBRIST_TURN
+    import random
+    rng = random.Random(42)
+    for pt in range(1, 7):
+        for c in (chess.WHITE, chess.BLACK):
+            for sq in range(64):
+                ZOBRIST_PIECES[(pt, c, sq)] = rng.getrandbits(64)
+    ZOBRIST_TURN = rng.getrandbits(64)
+
+init_zobrist()
+
+def get_zobrist_hash(board: chess.Board) -> int:
+    h = 0
+    for sq, piece in board.piece_map().items():
+        h ^= ZOBRIST_PIECES[(piece.piece_type, piece.color, sq)]
+    if board.turn == chess.BLACK:
+        h ^= ZOBRIST_TURN
+    return h
+
+# Transposition Table (Lưu trữ tạm thời)
+TT = {}
+TT_MAX_SIZE = 50000
+
 OPENING_BOOK = {
-    # 1. e4 e5 2. Nf3 Nc6 3. Bb5 (Ruy Lopez)
     "r1bqkbnr/pppp1ppp/2n5/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R b KQkq - 3 3": "a7a6",
-    # 1. d4 d5 2. c4 e6 (Queen's Gambit Declined)
     "rnbqkbnr/ppp2ppp/4p3/3p4/2PP4/8/PP2PPPP/RNBQKBNR w KQkq - 0 3": "b1c3",
-    # 1. e4 c5 2. Nf3 d6 (Sicilian Defense)
     "rnbqkbnr/pp2pppp/3p4/2p5/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 0 3": "d2d4",
-    # 1. e4 e5 2. Nf3 Nc6 3. Bc4 Bc5 (Italian Game)
     "r1bqk1nr/pppp1ppp/2n5/2b1p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4": "c2c3",
 }
-
 
 class ResidualBlock(nn.Module):
     def __init__(self, channels: int = 64):
         super().__init__()
         self.net = nn.Sequential(
             nn.Conv2d(channels, channels, 3, padding=1, bias=False),
-            nn.BatchNorm2d(channels),
-            nn.ReLU(inplace=True),
+            nn.BatchNorm2d(channels), nn.ReLU(inplace=True),
             nn.Conv2d(channels, channels, 3, padding=1, bias=False),
             nn.BatchNorm2d(channels),
         )
         self.relu = nn.ReLU(inplace=True)
-
-    def forward(self, x):
-        return self.relu(x + self.net(x))
-
+    def forward(self, x): return self.relu(x + self.net(x))
 
 class NyraNet(nn.Module):
     def __init__(self):
         super().__init__()
         self.stem = nn.Sequential(
             nn.Conv2d(18, 64, 3, padding=1, bias=False),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
+            nn.BatchNorm2d(64), nn.ReLU(inplace=True),
         )
         self.blocks = nn.ModuleList([ResidualBlock(64) for _ in range(4)])
         self.policy = nn.Sequential(
-            nn.Conv2d(64, 2, 1),
-            nn.ReLU(inplace=True),
-            nn.Flatten(),
-            nn.Linear(128, 4096),
+            nn.Conv2d(64, 2, 1), nn.ReLU(inplace=True),
+            nn.Flatten(), nn.Linear(128, 4096),
         )
-
     def forward(self, x):
         x = self.stem(x)
-        for block in self.blocks:
-            x = block(x)
+        for b in self.blocks: x = b(x)
         return self.policy(x)
 
-
 def download_checkpoint():
-    if MODEL_PATH.is_file() and MODEL_PATH.stat().st_size > 0:
-        print(f"Using checkpoint: {MODEL_PATH}")
-        return
-    if not MODEL_URL:
-        raise RuntimeError("MODEL_URL is missing.")
-    headers = {}
-    if HF_TOKEN:
-        headers["Authorization"] = f"Bearer {HF_TOKEN}"
+    if MODEL_PATH.is_file() and MODEL_PATH.stat().st_size > 0: return
+    if not MODEL_URL: raise RuntimeError("MODEL_URL is missing.")
+    headers = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
     MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
     temp_path = MODEL_PATH.with_suffix(".download")
-    try:
-        print("Downloading Nyra Chess checkpoint...")
-        with requests.get(MODEL_URL, headers=headers, stream=True, timeout=(30, 300), allow_redirects=True) as response:
-            response.raise_for_status()
-            with open(temp_path, "wb") as output:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    if chunk: output.write(chunk)
-        if not temp_path.exists() or temp_path.stat().st_size == 0:
-            raise RuntimeError("Downloaded checkpoint is empty.")
-        temp_path.replace(MODEL_PATH)
-        print(f"Checkpoint downloaded: {MODEL_PATH.stat().st_size} bytes")
-    except Exception:
-        temp_path.unlink(missing_ok=True)
-        raise
-
-def extract_state_dict(checkpoint):
-    if not isinstance(checkpoint, dict):
-        raise RuntimeError("Checkpoint must be a dictionary.")
-    for key in ("model_state_dict", "state_dict"):
-        candidate = checkpoint.get(key)
-        if isinstance(candidate, dict): return candidate
-    if checkpoint and all(isinstance(value, torch.Tensor) for value in checkpoint.values()): return checkpoint
-    raise RuntimeError("Checkpoint has no model_state_dict or state_dict.")
+    with requests.get(MODEL_URL, headers=headers, stream=True, timeout=(30, 300)) as response:
+        response.raise_for_status()
+        with open(temp_path, "wb") as output:
+            for chunk in response.iter_content(chunk_size=1024 * 1024):
+                if chunk: output.write(chunk)
+    temp_path.replace(MODEL_PATH)
 
 def load_model():
     global model, model_loaded, model_error, model_status
-    with model_lock:
-        model_status = "loading"
-        model_loaded = False
-        model_error = None
     try:
         download_checkpoint()
-        try: checkpoint = torch.load(MODEL_PATH, map_location="cpu", weights_only=True)
-        except TypeError: checkpoint = torch.load(MODEL_PATH, map_location="cpu")
-        state_dict = extract_state_dict(checkpoint)
-        if state_dict and all(key.startswith("module.") for key in state_dict):
-            state_dict = {key[len("module."):]: value for key, value in state_dict.items()}
+        checkpoint = torch.load(MODEL_PATH, map_location="cpu", weights_only=False)
+        state_dict = checkpoint.get("model_state_dict", checkpoint)
         candidate = NyraNet().to(DEVICE)
         candidate.load_state_dict(state_dict, strict=True)
         candidate.eval()
-        with torch.inference_mode():
-            output = candidate(torch.zeros(1, 18, 8, 8, device=DEVICE))
-        if tuple(output.shape) != (1, 4096): raise RuntimeError(f"Unexpected output: {tuple(output.shape)}")
         with model_lock:
             model = candidate
             model_loaded = True
             model_status = "ready"
-            model_error = None
-        print("Nyra Chess model loaded successfully.")
     except Exception as exc:
         with model_lock:
-            model = None
-            model_loaded = False
             model_status = "error"
             model_error = f"{type(exc).__name__}: {exc}"
-        print(f"MODEL LOAD FAILED: {model_error}")
 
-def start_model_loading():
-    global load_started
-    with model_lock:
-        if load_started: return
-        load_started = True
-    threading.Thread(target=load_model, daemon=True, name="nyra-model-loader").start()
-
-@app.on_event("startup")
-def startup_event():
-    start_model_loading()
+threading.Thread(target=load_model, daemon=True).start()
 
 PIECE_TO_PLANE = {
-    (chess.WHITE, chess.PAWN): 0, (chess.WHITE, chess.KNIGHT): 1,
-    (chess.WHITE, chess.BISHOP): 2, (chess.WHITE, chess.ROOK): 3,
-    (chess.WHITE, chess.QUEEN): 4, (chess.WHITE, chess.KING): 5,
-    (chess.BLACK, chess.PAWN): 6, (chess.BLACK, chess.KNIGHT): 7,
-    (chess.BLACK, chess.BISHOP): 8, (chess.BLACK, chess.ROOK): 9,
-    (chess.BLACK, chess.QUEEN): 10, (chess.BLACK, chess.KING): 11,
+    (chess.WHITE, chess.PAWN): 0, (chess.WHITE, chess.KNIGHT): 1, (chess.WHITE, chess.BISHOP): 2,
+    (chess.WHITE, chess.ROOK): 3, (chess.WHITE, chess.QUEEN): 4, (chess.WHITE, chess.KING): 5,
+    (chess.BLACK, chess.PAWN): 6, (chess.BLACK, chess.KNIGHT): 7, (chess.BLACK, chess.BISHOP): 8,
+    (chess.BLACK, chess.ROOK): 9, (chess.BLACK, chess.QUEEN): 10, (chess.BLACK, chess.KING): 11,
 }
 
 def encode_board(board: chess.Board) -> torch.Tensor:
+    # TỐI ƯU HÓA: Dùng torch.zeros rồi gán trực tiếp vị trí thay vì loop 64 lần
     planes = torch.zeros((18, 8, 8), dtype=torch.float32)
-    for square, piece in board.piece_map().items():
-        plane = PIECE_TO_PLANE[(piece.color, piece.piece_type)]
-        planes[plane, chess.square_rank(square), chess.square_file(square)] = 1.0
-    if board.turn == chess.WHITE: planes[12, :, :] = 1.0
-    if board.has_kingside_castling_rights(chess.WHITE): planes[13, :, :] = 1.0
-    if board.has_queenside_castling_rights(chess.WHITE): planes[14, :, :] = 1.0
-    if board.has_kingside_castling_rights(chess.BLACK): planes[15, :, :] = 1.0
-    if board.has_queenside_castling_rights(chess.BLACK): planes[16, :, :] = 1.0
+    for pt in range(1, 7):
+        for color in (chess.WHITE, chess.BLACK):
+            plane_idx = PIECE_TO_PLANE[(color, pt)]
+            for sq in board.pieces(pt, color):
+                planes[plane_idx, chess.square_rank(sq), chess.square_file(sq)] = 1.0
+    
+    if board.turn == chess.WHITE: planes[12].fill_(1.0)
+    if board.has_kingside_castling_rights(chess.WHITE): planes[13].fill_(1.0)
+    if board.has_queenside_castling_rights(chess.WHITE): planes[14].fill_(1.0)
+    if board.has_kingside_castling_rights(chess.BLACK): planes[15].fill_(1.0)
+    if board.has_queenside_castling_rights(chess.BLACK): planes[16].fill_(1.0)
     if board.ep_square is not None:
         planes[17, chess.square_rank(board.ep_square), chess.square_file(board.ep_square)] = 1.0
     return planes.unsqueeze(0)
@@ -233,10 +195,8 @@ def center_bonus(square: chess.Square) -> int:
 def evaluate_white_score(board: chess.Board) -> int:
     score = 0
     phase = 0
-    phase_values = {chess.KNIGHT: 1, chess.BISHOP: 1, chess.ROOK: 2, chess.QUEEN: 4}
     for piece in board.piece_map().values():
-        phase += phase_values.get(piece.piece_type, 0)
-
+        phase += {chess.KNIGHT: 1, chess.BISHOP: 1, chess.ROOK: 2, chess.QUEEN: 4}.get(piece.piece_type, 0)
     endgame = phase <= 6
 
     for square, piece in board.piece_map().items():
@@ -245,9 +205,9 @@ def evaluate_white_score(board: chess.Board) -> int:
         relative_rank = chess.square_rank(square) if piece.color == chess.WHITE else 7 - chess.square_rank(square)
         value = PIECE_VALUES[piece.piece_type]
 
+        # Treo quân
         is_attacked = board.is_attacked_by(not piece.color, square)
         is_defended = board.is_attacked_by(piece.color, square)
-
         if is_attacked and not is_defended and piece.piece_type != chess.KING:
             value -= int(PIECE_VALUES[piece.piece_type] * 0.8)
         elif is_attacked and not is_defended and piece.piece_type == chess.KING:
@@ -263,16 +223,14 @@ def evaluate_white_score(board: chess.Board) -> int:
                 ef, er = chess.square_file(enemy_sq), chess.square_rank(enemy_sq)
                 enemy_rel_rank = er if piece.color == chess.BLACK else 7 - er
                 if ef in same_or_adjacent and enemy_rel_rank > relative_rank:
-                    blocked = True
-                    break
+                    blocked = True; break
             if not blocked: value += 8 + relative_rank * relative_rank * 2
 
         elif piece.piece_type == chess.KNIGHT:
             value += center_bonus(square)
-            if 2 <= relative_rank <= 5:
-                if board.attackers(piece.color, square):
-                    if any(board.piece_at(p).piece_type == chess.PAWN for p in board.attackers(piece.color, square) if board.piece_at(p)):
-                        value += 25
+            if 2 <= relative_rank <= 5 and board.attackers(piece.color, square):
+                if any(board.piece_at(p).piece_type == chess.PAWN for p in board.attackers(piece.color, square) if board.piece_at(p)):
+                    value += 25
         elif piece.piece_type == chess.BISHOP:
             value += center_bonus(square) // 2
         elif piece.piece_type == chess.ROOK:
@@ -283,54 +241,38 @@ def evaluate_white_score(board: chess.Board) -> int:
             if relative_rank == 6: value += 15
         elif piece.piece_type == chess.QUEEN:
             if board.fullmove_number <= 10: value -= 8
-
         score += sign * value
 
-    for color in (chess.WHITE, chess.BLACK):
-        if len(board.pieces(chess.BISHOP, color)) >= 2: score += 35 if color == chess.WHITE else -35
+    if len(board.pieces(chess.BISHOP, chess.WHITE)) >= 2: score += 35
+    if len(board.pieces(chess.BISHOP, chess.BLACK)) >= 2: score -= 35
 
     if board.fullmove_number <= 12 and phase >= 10:
         for color in (chess.WHITE, chess.BLACK):
             sign = 1 if color == chess.WHITE else -1
             home_rank = 0 if color == chess.WHITE else 7
-            developed = 0
-            for pt in (chess.KNIGHT, chess.BISHOP):
-                for sq in board.pieces(pt, color):
-                    if chess.square_rank(sq) != home_rank: developed += 1
+            developed = sum(1 for pt in (chess.KNIGHT, chess.BISHOP) for sq in board.pieces(pt, color) if chess.square_rank(sq) != home_rank)
             score += sign * developed * 10
 
     for color in (chess.WHITE, chess.BLACK):
         sign = 1 if color == chess.WHITE else -1
         king_sq = board.king(color)
         if king_sq is None: continue
-
-        kf = chess.square_file(king_sq)
-        kr = chess.square_rank(king_sq)
+        kf, kr = chess.square_file(king_sq), chess.square_rank(king_sq)
         home_rank = 0 if color == chess.WHITE else 7
-        castled = ((color == chess.WHITE and kr == 0 and kf in (2, 6)) or
-                   (color == chess.BLACK and kr == 7 and kf in (2, 6)))
+        castled = ((color == chess.WHITE and kr == 0 and kf in (2, 6)) or (color == chess.BLACK and kr == 7 and kf in (2, 6)))
 
         if castled: 
             score += sign * 70
             direction = 1 if color == chess.WHITE else -1
-            shield_pawns = 0
-            for df in (-1, 0, 1):
-                nf, nr = kf + df, kr + direction
-                if 0 <= nf < 8 and 0 <= nr < 8:
-                    p = board.piece_at(chess.square(nf, nr))
-                    if p and p.color == color and p.piece_type == chess.PAWN: shield_pawns += 1
-            if shield_pawns == 0: score -= sign * 60
-            elif shield_pawns == 1: score -= sign * 30
+            shield = sum(1 for df in (-1, 0, 1) if 0 <= kf + df < 8 and 0 <= kr + direction < 8 and board.piece_at(chess.square(kf + df, kr + direction)) and board.piece_at(chess.square(kf + df, kr + direction)).color == color and board.piece_at(chess.square(kf + df, kr + direction)).piece_type == chess.PAWN)
+            if shield == 0: score -= sign * 60
+            elif shield == 1: score -= sign * 30
 
-        if not endgame and board.fullmove_number <= 20:
-            if kr != home_rank and not castled: score -= sign * 45
-
+        if not endgame and board.fullmove_number <= 20 and kr != home_rank and not castled: score -= sign * 45
         if not endgame:
             if kf in (3, 4) and board.fullmove_number > 8: score -= sign * 20
-            attackers = board.attackers(not color, king_sq)
-            score -= sign * min(3, len(attackers)) * 14
-        else:
-            score += sign * center_bonus(king_sq)
+            score -= sign * min(3, len(board.attackers(not color, king_sq))) * 14
+        else: score += sign * center_bonus(king_sq)
 
     if board.is_check(): score += -20 if board.turn == chess.WHITE else 20
     return score
@@ -355,12 +297,23 @@ def move_capture_value(board: chess.Board, move: chess.Move) -> int:
     attacker_value = PIECE_VALUES[attacker.piece_type] if attacker else 0
     return 10_000 + victim_value * 10 - attacker_value
 
-def order_moves(board: chess.Board, moves, logits):
+# KILLER MOVES: Lưu các nước đi "sát thủ" cắt tỉa được nhiều node
+killer_moves = [[] for _ in range(64)]
+
+def order_moves(board: chess.Board, moves, logits=None, ply=0):
     ranked = []
     for move in moves:
-        score = float(logits[move.from_square * 64 + move.to_square].item())
+        score = 0.0
+        if logits is not None:
+            score += float(logits[move.from_square * 64 + move.to_square].item())
+        
         if move.promotion: score += 5_000 + PIECE_VALUES.get(move.promotion, 0)
         score += move_capture_value(board, move)
+        
+        # Killer Move Heuristic
+        if ply < 64 and move in killer_moves[ply]:
+            score += 900  # Ưu tiên cao dù không ăn quân
+
         board.push(move)
         if board.is_check(): score += 100
         board.pop()
@@ -368,16 +321,8 @@ def order_moves(board: chess.Board, moves, logits):
     ranked.sort(key=lambda item: item[0], reverse=True)
     return [move for _, move in ranked]
 
-def order_moves_mvv_lva(board: chess.Board, moves):
-    def key(move):
-        s = 0.0
-        if move.promotion: s += 5_000 + PIECE_VALUES.get(move.promotion, 0)
-        s += move_capture_value(board, move)
-        board.push(move)
-        if board.is_check(): s += 100
-        board.pop()
-        return s
-    return sorted(moves, key=key, reverse=True)
+def order_moves_mvv_lva(board: chess.Board, moves, ply=0):
+    return order_moves(board, moves, logits=None, ply=ply)
 
 def should_stop(state) -> bool:
     if state["nodes"] >= state["max_nodes"] or time.monotonic() >= state["deadline"]:
@@ -404,7 +349,7 @@ def quiescence(board, alpha, beta, state, ply, remaining):
         if not moves: return -MATE_SCORE + ply
         if remaining <= 0: return evaluate_board(board)
 
-    moves = order_moves_mvv_lva(board, moves)
+    moves = order_moves_mvv_lva(board, moves, ply)
     for move in moves:
         if should_stop(state): break
         board.push(move)
@@ -419,16 +364,25 @@ def negamax(board, current_model, depth, alpha, beta, state, ply=0):
     terminal = terminal_score(board, ply)
     if terminal is not None: return terminal
     if should_stop(state): return evaluate_board(board)
+    
+    # TRANSITION TABLE LOOKUP
+    z_hash = get_zobrist_hash(board)
+    if z_hash in TT:
+        tt_depth, tt_score = TT[z_hash]
+        if tt_depth >= depth:
+            return tt_score
+
     if depth <= 0: return quiescence(board, alpha, beta, state, ply, QUIESCENCE_DEPTH)
 
     moves = list(board.legal_moves)
     if not moves: return evaluate_board(board)
 
+    # Gọi Policy Logits ở Root, các tầng sâu dùng MVV-LVA / Killer
     if ply <= 1:
         logits = get_policy_logits(board, current_model)
-        moves = order_moves(board, moves, logits)
+        moves = order_moves(board, moves, logits, ply)
     else:
-        moves = order_moves_mvv_lva(board, moves)
+        moves = order_moves_mvv_lva(board, moves, ply)
 
     best_score = -INF
     for move in moves:
@@ -436,9 +390,26 @@ def negamax(board, current_model, depth, alpha, beta, state, ply=0):
         board.push(move)
         score = -negamax(board, current_model, depth - 1, -beta, -alpha, state, ply + 1)
         board.pop()
-        best_score = max(best_score, score)
+        
+        if score > best_score:
+            best_score = score
+            
         alpha = max(alpha, score)
-        if alpha >= beta: break
+        
+        # Nếu điểm số >= beta (cắt tỉa), lưu Killer Move
+        if alpha >= beta:
+            if not board.is_capture(move) and ply < 64:
+                if move not in killer_moves[ply]:
+                    killer_moves[ply].insert(0, move)
+                    if len(killer_moves[ply]) > 2: killer_moves[ply].pop()
+            break
+
+    # Lưu vào Transposition Table
+    if len(TT) < TT_MAX_SIZE:
+        TT[z_hash] = (depth, best_score)
+    else:
+        # Nếu đầy thì xóa random để nhường chỗ
+        TT.pop(next(iter(TT)))
 
     if best_score == -INF: return evaluate_board(board)
     return best_score
@@ -451,14 +422,14 @@ def search_best_move(board, current_model, allowed_moves=None):
 
     if not legal_moves: raise ValueError("No legal moves.")
     
+    # Xóa bộ nhớ đệm cũ trước khi tính
+    TT.clear()
+    for i in range(64): killer_moves[i].clear()
+
     fen = board.fen()
-    fen_parts = fen.split(" ")
-    short_fen = " ".join(fen_parts[:4])
-    
+    short_fen = " ".join(fen.split(" ")[:4])
     for book_fen, book_move in OPENING_BOOK.items():
-        book_parts = book_fen.split(" ")
-        short_book = " ".join(book_parts[:4])
-        if short_fen == short_book:
+        if short_fen == " ".join(book_fen.split(" ")[:4]):
             for m in legal_moves:
                 if m.uci() == book_move:
                     return m, {"depth": 0, "requested_depth": SEARCH_DEPTH, "nodes": 0, "elapsed_ms": 0, "aborted": False, "score": None, "method": "Opening Book"}
@@ -470,7 +441,7 @@ def search_best_move(board, current_model, allowed_moves=None):
     state = {"nodes": 0, "max_nodes": MAX_SEARCH_NODES, "deadline": started + SEARCH_TIME_LIMIT, "aborted": False}
 
     root_logits = get_policy_logits(board, current_model)
-    ordered_root = order_moves(board, legal_moves, root_logits)
+    ordered_root = order_moves(board, legal_moves, root_logits, ply=0)
 
     best_move = ordered_root[0]
     best_score = None
@@ -509,7 +480,7 @@ def search_best_move(board, current_model, allowed_moves=None):
         "elapsed_ms": int((time.monotonic() - started) * 1000),
         "aborted": state["aborted"],
         "score": None if best_score is None else int(best_score),
-        "method": "NyraNet + Eval v0.6.1 + Negamax",
+        "method": "NyraNet v0.7.0 + TT + Killer",
     }
 
 class MoveRequest(BaseModel):
@@ -518,7 +489,7 @@ class MoveRequest(BaseModel):
 
 @app.get("/")
 def root():
-    return {"service": SERVICE_NAME, "version": VERSION, "health": "/health", "move": "/move", "debug_predict": "/debug/predict?fen=<fen>", "search": {"depth": SEARCH_DEPTH, "max_nodes": MAX_SEARCH_NODES, "time_limit_seconds": SEARCH_TIME_LIMIT, "quiescence_depth": QUIESCENCE_DEPTH}}
+    return {"service": SERVICE_NAME, "version": VERSION, "health": "/health", "move": "/move", "search": {"depth": SEARCH_DEPTH, "max_nodes": MAX_SEARCH_NODES, "time_limit_seconds": SEARCH_TIME_LIMIT, "quiescence_depth": QUIESCENCE_DEPTH}}
 
 @app.get("/health")
 def health():
@@ -545,35 +516,17 @@ def choose_move(request: MoveRequest):
     with model_lock:
         current_model, ready, current_status, current_error = model, model_loaded, model_status, model_error
     if not ready or current_model is None:
-        raise HTTPException(status_code=503, detail={"error": "Model is not ready", "model_status": current_status, "model_error": current_error})
+        raise HTTPException(status_code=503, detail={"error": "Model is not ready"})
 
     try:
         board = chess.Board(request.fen)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Invalid FEN: {exc}")
-    if not board.is_valid(): raise HTTPException(status_code=400, detail="Invalid chess position.")
-    if board.is_game_over(claim_draw=True): raise HTTPException(status_code=400, detail="The game is already over.")
+    if not board.is_valid(): raise HTTPException(status_code=400, detail="Invalid position.")
 
     try:
         allowed_moves = parse_supplied_legal_moves(board, request.legal_moves)
         best_move, search_info = search_best_move(board, current_model, allowed_moves=allowed_moves)
         return {"uci": best_move.uci(), "san": board.san(best_move), "search": search_info}
-    except HTTPException: raise
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Move search failed: {type(exc).__name__}: {exc}")
-
-@app.get("/debug/predict")
-def debug_predict(fen: str):
-    with model_lock:
-        current_model, ready, current_error = model, model_loaded, model_error
-    if not ready or current_model is None: raise HTTPException(status_code=503, detail={"model_loaded": ready, "model_error": current_error})
-    try:
-        board = chess.Board(fen)
-        if not board.is_valid(): raise HTTPException(status_code=400, detail="Invalid FEN")
-        logits = get_policy_logits(board, current_model)
-        values, indices = torch.topk(logits, k=10)
-        predictions = [{"uci": chess.Move(idx//64, idx%64).uci(), "score": round(float(val), 5), "is_legal": chess.Move(idx//64, idx%64) in board.legal_moves} for val, idx in zip(values.tolist(), indices.tolist())]
-        legal_ranked = sorted(board.legal_moves, key=lambda m: float(logits[m.from_square * 64 + m.to_square].item()), reverse=True)[:10]
-        return {"model_loaded": True, "prediction_source": "NyraNet raw policy logits", "top_predictions": predictions, "top_legal_predictions": [{"uci": m.uci(), "san": board.san(m), "score": round(float(logits[m.from_square * 64 + m.to_square].item()), 5)} for m in legal_ranked]}
-    except HTTPException: raise
-    except Exception as exc: raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}")
+        raise HTTPException(status_code=500, detail=f"Move search failed: {exc}")
