@@ -40,7 +40,7 @@ std::unordered_map<uint64_t, TTEntry> transposition_table;
 std::chrono::steady_clock::time_point start_time;
 bool time_is_up = false;
 const int TIME_LIMIT_MS = 4000; 
-const int MAX_DEPTH = 7; // Tăng Depth lên 7 vì hàm eval C++ rất nhanh
+const int MAX_DEPTH = 6;
 
 void init_zobrist() {
     std::mt19937_64 rng(12345);
@@ -80,9 +80,6 @@ void encode_board(const Board& board, std::vector<float>& tensor) {
     }
 }
 
-// ============================================================
-// HÀM EVAL XỊN (PORT TỪ BẢN PYTHON SANG)
-// ============================================================
 int center_bonus(int sq) {
     int file_idx = sq % 8;
     int rank_idx = sq / 8;
@@ -94,7 +91,6 @@ int evaluate_white_score(Board& board) {
     int score = 0;
     int phase = 0;
     
-    // Đếm phase (Quân nặng còn nhiều -> Trung cuộc)
     for (int sq = 0; sq < 64; sq++) {
         Piece p = board.at(sq);
         if (p != Piece::NONE) {
@@ -120,19 +116,15 @@ int evaluate_white_score(Board& board) {
         Square s = static_cast<Square>(sq);
         Color enemy = (p.color() == Color::WHITE) ? Color::BLACK : Color::WHITE;
 
-        // 1. Phạt quân bị treo
         bool is_attacked = board.isAttacked(s, enemy);
         bool is_defended = board.isAttacked(s, p.color());
         if (is_attacked && !is_defended && p.type() != PieceType::KING) {
             val -= static_cast<int>(PIECE_VALUES[pt_idx] * 0.8);
         }
 
-        // 2. Logic từng quân cờ
         if (p.type() == PieceType::PAWN) {
             val += relative_rank * 5;
             if (file == 3 || file == 4) val += 5;
-            
-            // Passed pawn (Tốt thông)
             bool blocked = false;
             for (int e_sq = 0; e_sq < 64; e_sq++) {
                 Piece ep = board.at(e_sq);
@@ -149,22 +141,18 @@ int evaluate_white_score(Board& board) {
 
         } else if (p.type() == PieceType::KNIGHT) {
             val += center_bonus(sq);
-            if (relative_rank >= 2 && relative_rank <= 5 && is_defended) {
-                // Knight Outpost đơn giản
-                val += 25;
-            }
+            if (relative_rank >= 2 && relative_rank <= 5 && is_defended) val += 25;
         } else if (p.type() == PieceType::BISHOP) {
             val += center_bonus(sq) / 2;
         } else if (p.type() == PieceType::ROOK) {
-            if (relative_rank == 6) val += 15; // Rook on 7th rank
+            if (relative_rank == 6) val += 15;
         } else if (p.type() == PieceType::QUEEN) {
-            if (board.fullMoveNumber() <= 10) val -= 8; // Phạt Hậu ra sớm
+            if (board.fullMoveNumber() <= 10) val -= 8;
         }
 
         score += sign * val;
     }
 
-    // 3. Cặp Tượng
     int w_bishops = 0, b_bishops = 0;
     for(int sq=0; sq<64; sq++) {
         Piece p = board.at(sq);
@@ -175,7 +163,6 @@ int evaluate_white_score(Board& board) {
     if (w_bishops >= 2) score += 35;
     if (b_bishops >= 2) score -= 35;
 
-    // 4. An toàn Vua & Nhập thành
     for (Color color : {Color::WHITE, Color::BLACK}) {
         int sign = (color == Color::WHITE) ? 1 : -1;
         Square k_sq = board.kingSq(color);
@@ -203,7 +190,7 @@ int evaluate_white_score(Board& board) {
         }
 
         if (!endgame && board.fullMoveNumber() <= 20 && kr != home_rank && !castled) {
-            score -= sign * 45; // Phạt vua đi lang thang
+            score -= sign * 45;
         }
 
         if (!endgame) {
@@ -214,14 +201,24 @@ int evaluate_white_score(Board& board) {
     return score;
 }
 
+// --- HÀM ĐÁNH GIÁ CÓ REPETITION PENALTY VÀ RANDOM NOISE ---
 int evaluate_board(Board& board) {
     if (board.isGameOver().second == GameResult::LOSE) return -MATE_SCORE;
     if (board.isGameOver().second == GameResult::DRAW) return 0;
+    
+    // NẾU THẾ CỜ BỊ LẶP LẠI 2 LẦN, COI NHƯ HÒA (0 ĐIỂM) ĐỂ TRÁNH VÒNG LẶP VÔ HẠN
+    if (board.isRepetition(2)) return 0;
+
     int score = evaluate_white_score(board);
+    
+    // Thêm Random Noise để phá vỡ thế trận hòa
+    static std::mt19937 gen(std::random_device{}());
+    std::uniform_int_distribution<> distr(-15, 15); // Nhiễu từ -15 đến 15
+    score += distr(gen); 
+    
     return (board.sideToMove() == Color::WHITE) ? score : -score;
 }
 
-// --- SẮP XẾP NƯỚC ĐI BẰNG NEURAL NETWORK (Move Ordering) ---
 void order_moves_with_nn(Board& board, Movelist& moves) {
     std::vector<float> inputs(18 * 8 * 8);
     encode_board(board, inputs);
@@ -237,7 +234,6 @@ void order_moves_with_nn(Board& board, Movelist& moves) {
     sm.reserve(moves.size());
     for (int i = 0; i < moves.size(); i++) {
         int idx = moves[i].from().index() * 64 + moves[i].to().index();
-        // Điểm từ mạng Neural + Điểm thưởng nếu ăn quân
         float s = logits[idx] + (board.isCapture(moves[i]) ? 1000.0f : 0.0f); 
         sm.push_back({moves[i], s});
     }
@@ -254,7 +250,7 @@ void order_moves_mvv_lva(Board& board, Movelist& moves) {
         if (board.isCapture(moves[i])) {
             Piece victim = board.at(moves[i].to());
             if (victim != Piece::NONE) score = 10 * PIECE_VALUES[static_cast<int>(victim.type())] - PIECE_VALUES[static_cast<int>(board.at(moves[i].from()).type())];
-            else score = 1000; // En passant
+            else score = 1000;
         }
         sm.push_back({moves[i], score});
     }
@@ -330,12 +326,10 @@ int negamax(Board& board, int depth, int alpha, int beta, bool root = false) {
         int score;
         int new_depth = depth - 1 + extension;
 
-        // LMR
         if (i >= 3 && depth >= 3 && !in_check && !board.isCapture(moves[i]) && static_cast<int>(board.givesCheck(moves[i])) == 0) {
             new_depth -= 1; 
         }
 
-        // PVS
         if (i == 0) {
             score = -negamax(board, new_depth, -beta, -alpha);
         } else {
