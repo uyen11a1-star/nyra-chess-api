@@ -13,11 +13,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 # ============================================================
-# NYRA CHESS API 0.5.1 (Fixed Knight Outpost Bug)
+# NYRA CHESS API 0.6.0
+# - Fix: Thêm Opening Book (Khai cuộc chuẩn)
+# - Fix: Phạt quân bị treo (Hanging piece) & Vua hở sườn
 # ============================================================
 
 SERVICE_NAME = "Nyra Chess API"
-VERSION = "0.5.1"
+VERSION = "0.6.0"
 
 MODEL_URL = os.getenv("MODEL_URL", "").strip()
 HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
@@ -60,6 +62,20 @@ PIECE_VALUES = {
     chess.KING: 0,
 }
 
+# --- SÁCH KHAI CUỘC (OPENING BOOK) ---
+# Các thế cờ đầu game (FEN) và nước đi tương ứng (UCI)
+OPENING_BOOK = {
+    # 1. e4 e5 2. Nf3 Nc6 3. Bb5 (Ruy Lopez)
+    "r1bqkbnr/pppp1ppp/2n5/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R b KQkq - 3 3": "a7a6",
+    # 1. d4 d5 2. c4 e6 (Queen's Gambit Declined)
+    "rnbqkbnr/ppp2ppp/4p3/3p4/2PP4/8/PP2PPPP/RNBQKBNR w KQkq - 0 3": "b1c3",
+    # 1. e4 c5 2. Nf3 d6 (Sicilian Defense)
+    "rnbqkbnr/pp2pppp/3p4/2p5/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 0 3": "d2d4",
+    # 1. e4 e5 2. Nf3 Nc6 3. Bc4 Bc5 (Italian Game)
+    "r1bqk1nr/pppp1ppp/2n5/2b1p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4": "c2c3",
+}
+
+
 class ResidualBlock(nn.Module):
     def __init__(self, channels: int = 64):
         super().__init__()
@@ -74,6 +90,7 @@ class ResidualBlock(nn.Module):
 
     def forward(self, x):
         return self.relu(x + self.net(x))
+
 
 class NyraNet(nn.Module):
     def __init__(self):
@@ -96,6 +113,7 @@ class NyraNet(nn.Module):
         for block in self.blocks:
             x = block(x)
         return self.policy(x)
+
 
 def download_checkpoint():
     if MODEL_PATH.is_file() and MODEL_PATH.stat().st_size > 0:
@@ -220,17 +238,26 @@ def evaluate_white_score(board: chess.Board) -> int:
 
     endgame = phase <= 6
 
+    # 1. Đánh giá quân cờ & Phạt treo quân (Hanging Pieces)
     for square, piece in board.piece_map().items():
         sign = 1 if piece.color == chess.WHITE else -1
         file_idx = chess.square_file(square)
-        rank_idx = chess.square_rank(square)
-        relative_rank = rank_idx if piece.color == chess.WHITE else 7 - rank_idx
+        relative_rank = chess.square_rank(square) if piece.color == chess.WHITE else 7 - chess.square_rank(square)
         value = PIECE_VALUES[piece.piece_type]
+
+        # Kiểm tra xem quân này có đang bị tấn công không
+        is_attacked = board.is_attacked_by(not piece.color, square)
+        is_defended = board.is_attacked_by(piece.color, square)
+
+        # Nếu bị tấn công mà không có ai bảo vệ (hoặc bị tấn công bởi quân rẻ hơn) -> Phạt nặng
+        if is_attacked and not is_defended and piece.piece_type != chess.KING:
+            value -= int(PIECE_VALUES[piece.piece_type] * 0.8) # Phạt 80% giá trị quân
+        elif is_attacked and not is_defended and piece.piece_type == chess.KING:
+            value -= 500 # Vua bị tấn công mà không có quân che chắn
 
         if piece.piece_type == chess.PAWN:
             value += relative_rank * 5
             if file_idx in (3, 4): value += 5
-            
             enemy_pawns = board.pieces(chess.PAWN, not piece.color)
             same_or_adjacent = [f for f in (file_idx - 1, file_idx, file_idx + 1) if 0 <= f < 8]
             blocked = False
@@ -242,18 +269,12 @@ def evaluate_white_score(board: chess.Board) -> int:
                     break
             if not blocked: value += 8 + relative_rank * relative_rank * 2
 
-            own_pawns = board.pieces(chess.PAWN, piece.color)
-            has_adjacent = any(chess.square_file(sq) in (file_idx - 1, file_idx + 1) for sq in own_pawns)
-            if not has_adjacent: value -= 15
-
         elif piece.piece_type == chess.KNIGHT:
             value += center_bonus(square)
             if 2 <= relative_rank <= 5:
                 if board.attackers(piece.color, square):
-                    # FIX LỖI Ở ĐÂY: Phải lấy quân cờ tại ô đó (board.piece_at), không phải ô cờ (p)
-                    if any(board.piece_at(p).piece_type == chess.PAWN for p in board.attackers(piece.color, square)):
+                    if any(board.piece_at(p).piece_type == chess.PAWN for p in board.attackers(piece.color, square) if board.piece_at(p)):
                         value += 25
-
         elif piece.piece_type == chess.BISHOP:
             value += center_bonus(square) // 2
         elif piece.piece_type == chess.ROOK:
@@ -267,10 +288,11 @@ def evaluate_white_score(board: chess.Board) -> int:
 
         score += sign * value
 
+    # 2. Cặp Tượng
     for color in (chess.WHITE, chess.BLACK):
-        if len(board.pieces(chess.BISHOP, color)) >= 2:
-            score += 35 if color == chess.WHITE else -35
+        if len(board.pieces(chess.BISHOP, color)) >= 2: score += 35 if color == chess.WHITE else -35
 
+    # 3. Phát triển quân
     if board.fullmove_number <= 12 and phase >= 10:
         for color in (chess.WHITE, chess.BLACK):
             sign = 1 if color == chess.WHITE else -1
@@ -281,6 +303,7 @@ def evaluate_white_score(board: chess.Board) -> int:
                     if chess.square_rank(sq) != home_rank: developed += 1
             score += sign * developed * 10
 
+    # 4. An toàn Vua & Lỗ hổng nhập thành
     for color in (chess.WHITE, chess.BLACK):
         sign = 1 if color == chess.WHITE else -1
         king_sq = board.king(color)
@@ -289,51 +312,33 @@ def evaluate_white_score(board: chess.Board) -> int:
         kf = chess.square_file(king_sq)
         kr = chess.square_rank(king_sq)
         home_rank = 0 if color == chess.WHITE else 7
-
         castled = ((color == chess.WHITE and kr == 0 and kf in (2, 6)) or
                    (color == chess.BLACK and kr == 7 and kf in (2, 6)))
 
-        if castled: score += sign * 70
-        if not endgame and board.fullmove_number <= 20:
-            if kr != home_rank and not castled: score -= sign * 45
-
-        if not endgame:
+        if castled: 
+            score += sign * 70
+            # Phạt nếu Vua đã nhập thành nhưng bị mất Tốt che chắn phía trước (Lỗ hổng)
             direction = 1 if color == chess.WHITE else -1
-            shield = 0
+            shield_pawns = 0
             for df in (-1, 0, 1):
                 nf, nr = kf + df, kr + direction
                 if 0 <= nf < 8 and 0 <= nr < 8:
                     p = board.piece_at(chess.square(nf, nr))
-                    if p and p.color == color and p.piece_type == chess.PAWN: shield += 1
-            score += sign * shield * 9
+                    if p and p.color == color and p.piece_type == chess.PAWN: shield_pawns += 1
+            if shield_pawns == 0: score -= sign * 60 # Mất sạch tốt che chắn
+            elif shield_pawns == 1: score -= sign * 30
 
+        if not endgame and board.fullmove_number <= 20:
+            if kr != home_rank and not castled: score -= sign * 45
+
+        if not endgame:
             if kf in (3, 4) and board.fullmove_number > 8: score -= sign * 20
-
             attackers = board.attackers(not color, king_sq)
             score -= sign * min(3, len(attackers)) * 14
-            
-            zone_attacks = 0
-            for df in (-1, 0, 1):
-                for dr in (-1, 0, 1):
-                    if df == 0 and dr == 0: continue
-                    nf, nr = kf + df, kr + dr
-                    if 0 <= nf < 8 and 0 <= nr < 8:
-                        sq_around = chess.square(nf, nr)
-                        zone_attacks += len(board.attackers(not color, sq_around))
-            score -= sign * min(5, zone_attacks) * 5
-
         else:
             score += sign * center_bonus(king_sq)
 
-    for color in (chess.WHITE, chess.BLACK):
-        sign = 1 if color == chess.WHITE else -1
-        pawns = board.pieces(chess.PAWN, color)
-        for file_idx in range(8):
-            count = sum(chess.square_file(sq) == file_idx for sq in pawns)
-            if count > 1: score -= sign * (count - 1) * 12
-
     if board.is_check(): score += -20 if board.turn == chess.WHITE else 20
-
     return score
 
 def evaluate_board(board: chess.Board) -> int:
@@ -451,6 +456,21 @@ def search_best_move(board, current_model, allowed_moves=None):
         legal_moves = [move for move in legal_moves if move.uci() in allowed_uci]
 
     if not legal_moves: raise ValueError("No legal moves.")
+    
+    # --- KIỂM TRA SÁCH KHAI CUỘC ---
+    fen = board.fen()
+    # Lấy 4 trường đầu của FEN để so khớp (bỏ qua số nước đi)
+    fen_parts = fen.split(" ")
+    short_fen = " ".join(fen_parts[:4])
+    
+    for book_fen, book_move in OPENING_BOOK.items():
+        book_parts = book_fen.split(" ")
+        short_book = " ".join(book_parts[:4])
+        if short_fen == short_book:
+            for m in legal_moves:
+                if m.uci() == book_move:
+                    return m, {"depth": 0, "requested_depth": SEARCH_DEPTH, "nodes": 0, "elapsed_ms": 0, "aborted": False, "score": None, "method": "Opening Book"}
+
     if len(legal_moves) == 1:
         return legal_moves[0], {"depth": 0, "requested_depth": SEARCH_DEPTH, "nodes": 0, "elapsed_ms": 0, "aborted": False, "score": None, "method": "forced_move"}
 
@@ -497,7 +517,7 @@ def search_best_move(board, current_model, allowed_moves=None):
         "elapsed_ms": int((time.monotonic() - started) * 1000),
         "aborted": state["aborted"],
         "score": None if best_score is None else int(best_score),
-        "method": "NyraNet + Eval v0.5.1 + Negamax",
+        "method": "NyraNet + Eval v0.6.0 + Negamax",
     }
 
 class MoveRequest(BaseModel):
