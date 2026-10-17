@@ -13,12 +13,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 # ============================================================
-# NYRA CHESS API 0.7.2
-# - Fix: Only call NN at root (ply==0) for 10x speedup
+# NYRA CHESS API 0.8.0 (Speed Demon)
+# - Stockfish-like Search Optimizations:
+#   + PVS (Principal Variation Search)
+#   + LMR (Late Move Reductions)
+#   + NMP (Null Move Pruning)
+#   + Aspiration Windows
 # ============================================================
 
 SERVICE_NAME = "Nyra Chess API"
-VERSION = "0.7.2"
+VERSION = "0.8.0"
 
 MODEL_URL = os.getenv("MODEL_URL", "").strip()
 HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
@@ -57,6 +61,7 @@ PIECE_VALUES = {
     chess.ROOK: 500, chess.QUEEN: 900, chess.KING: 0,
 }
 
+# Zobrist Hashing
 ZOBRIST_PIECES = {}
 ZOBRIST_TURN = 0
 def init_zobrist():
@@ -79,6 +84,7 @@ def get_zobrist_hash(board: chess.Board) -> int:
         h ^= ZOBRIST_TURN
     return h
 
+# Transposition Table
 TT = {}
 TT_MAX_SIZE = 50000
 
@@ -343,6 +349,12 @@ def should_stop(state) -> bool:
         return True
     return False
 
+def has_non_pawn_material(board: chess.Board, color: chess.Color) -> bool:
+    for pt in (chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN):
+        if board.pieces(pt, color):
+            return True
+    return False
+
 def quiescence(board, alpha, beta, state, ply, remaining):
     state["nodes"] += 1
     terminal = terminal_score(board, ply)
@@ -386,10 +398,19 @@ def negamax(board, current_model, depth, alpha, beta, state, ply=0):
 
     if depth <= 0: return quiescence(board, alpha, beta, state, ply, QUIESCENCE_DEPTH)
 
+    in_check = board.is_check()
+
+    # NULL MOVE PRUNING (NMP)
+    if not in_check and depth >= 3 and has_non_pawn_material(board, board.turn):
+        board.push(chess.Move.null())
+        score = -negamax(board, current_model, depth - 3, -beta, -beta + 1, state, ply + 1)
+        board.pop()
+        if score >= beta:
+            return beta
+
     moves = list(board.legal_moves)
     if not moves: return evaluate_board(board)
 
-    # TỐI ƯU HÓA: Chỉ gọi mạng Neural ở nước đi gốc (Root)
     if ply == 0:
         logits = get_policy_logits(board, current_model)
         moves = order_moves(board, moves, logits, ply)
@@ -397,10 +418,30 @@ def negamax(board, current_model, depth, alpha, beta, state, ply=0):
         moves = order_moves_mvv_lva(board, moves, ply)
 
     best_score = -INF
-    for move in moves:
+    for i, move in enumerate(moves):
         if should_stop(state): break
+        
+        is_tactical = board.is_capture(move) or move.promotion
+        new_depth = depth - 1
+        
+        # LATE MOVE REDUCTIONS (LMR)
+        if i >= 3 and depth >= 3 and not is_tactical and not in_check:
+            new_depth -= 1
+
         board.push(move)
-        score = -negamax(board, current_model, depth - 1, -beta, -alpha, state, ply + 1)
+        
+        # PRINCIPAL VARIATION SEARCH (PVS)
+        if i == 0:
+            score = -negamax(board, current_model, new_depth, -beta, -alpha, state, ply + 1)
+        else:
+            score = -negamax(board, current_model, new_depth, -alpha - 1, -alpha, state, ply + 1)
+            if alpha < score < beta:
+                score = -negamax(board, current_model, new_depth, -beta, -alpha, state, ply + 1)
+
+        # Nếu nước bị giảm độ sâu (LMR) mà lại tốt, tính lại ở độ sâu đầy đủ
+        if new_depth < depth - 1 and score > alpha:
+            score = -negamax(board, current_model, depth - 1, -beta, -alpha, state, ply + 1)
+            
         board.pop()
         
         if score > best_score:
@@ -408,7 +449,7 @@ def negamax(board, current_model, depth, alpha, beta, state, ply=0):
         alpha = max(alpha, score)
         
         if alpha >= beta:
-            if not board.is_capture(move) and ply < 64:
+            if not is_tactical and ply < 64:
                 if move not in killer_moves[ply]:
                     killer_moves[ply].insert(0, move)
                     if len(killer_moves[ply]) > 2: killer_moves[ply].pop()
@@ -453,30 +494,51 @@ def search_best_move(board, current_model, allowed_moves=None):
     best_move = ordered_root[0]
     best_score = None
     completed_depth = 0
+    prev_score = 0
 
     for depth in range(1, SEARCH_DEPTH + 1):
         if should_stop(state): break
         iteration_move, iteration_score = None, -INF
+        
+        # ASPIRATION WINDOWS
         alpha, beta = -INF, INF
-        interrupted = False
+        if depth >= 4 and prev_score is not None:
+            alpha = max(-INF, prev_score - 50)
+            beta = min(INF, prev_score + 50)
 
-        for move in ordered_root:
-            if should_stop(state):
-                interrupted = True
+        while True:
+            interrupted = False
+            for move in ordered_root:
+                if should_stop(state):
+                    interrupted = True
+                    break
+                board.push(move)
+                score = -negamax(board, current_model, depth - 1, -beta, -alpha, state, ply=1)
+                board.pop()
+
+                if score > iteration_score:
+                    iteration_score, iteration_move = score, move
+                alpha = max(alpha, score)
+                if state["aborted"]:
+                    interrupted = True
+                    break
+
+            if interrupted:
                 break
-            board.push(move)
-            score = -negamax(board, current_model, depth - 1, -beta, -alpha, state, ply=1)
-            board.pop()
-
-            if score > iteration_score:
-                iteration_score, iteration_move = score, move
-            alpha = max(alpha, score)
-            if state["aborted"]:
-                interrupted = True
+            
+            # Nếu điểm vượt ra ngoài cửa sổ Aspiration, mở rộng và tìm lại
+            if iteration_score <= prev_score - 50:
+                beta = alpha + 1
+                alpha = -INF
+            elif iteration_score >= prev_score + 50:
+                alpha = beta - 1
+                beta = INF
+            else:
                 break
 
         if iteration_move is not None and not interrupted:
             best_move, best_score, completed_depth = iteration_move, iteration_score, depth
+            prev_score = best_score
         else:
             break
 
@@ -487,7 +549,7 @@ def search_best_move(board, current_model, allowed_moves=None):
         "elapsed_ms": int((time.monotonic() - started) * 1000),
         "aborted": state["aborted"],
         "score": None if best_score is None else int(best_score),
-        "method": "NyraNet v0.7.2 + TT + Killer",
+        "method": "NyraNet v0.8.0 (PVS+LMR+NMP)",
     }
 
 class MoveRequest(BaseModel):
