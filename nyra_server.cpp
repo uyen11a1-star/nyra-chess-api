@@ -38,10 +38,10 @@ enum TTFlag { EXACT, LOWERBOUND, UPPERBOUND };
 struct TTEntry { int depth; int score; TTFlag flag; Move best_move; };
 std::unordered_map<uint64_t, TTEntry> transposition_table;
 
-// --- BIẾN QUẢN LÝ THỜI GIAN ---
+// --- BIẾN QUẢN LÝ THỜI GIAN (Đã đồng bộ về steady_clock) ---
 std::chrono::steady_clock::time_point start_time;
 bool time_is_up = false;
-const int TIME_LIMIT_MS = 4000; // Tối đa 4 giây (Render timeout là 30s, nên 4s là cực kỳ an toàn)
+const int TIME_LIMIT_MS = 4000; // Tối đa 4 giây
 const int MAX_DEPTH = 8;        // Nhắm tới Depth 8, nhưng sẽ bị cắt bởi thời gian
 
 void init_zobrist() {
@@ -149,7 +149,7 @@ int negamax(Board& board, int depth, int alpha, int beta, bool root = false) {
     static int nodes = 0;
     nodes++;
     if ((nodes & 2047) == 0) { // Cứ 2048 nodes kiểm tra thời gian 1 lần
-        auto now = std::chrono::steady_clock::now();
+        auto now = std::chrono::steady_clock::now(); // Đã sửa thành steady_clock
         if (std::chrono::duration_cast<std::chrono::milliseconds>(now - start_time).count() >= TIME_LIMIT_MS) {
             time_is_up = true;
             return evaluate_board(board);
@@ -289,7 +289,7 @@ int main() {
         int completed_depth = 0;
 
         time_is_up = false;
-        start_time = std::chrono::steady_clock::now();
+        start_time = std::chrono::steady_clock::now(); // Đồng bộ steady_clock
 
         // ITERATIVE DEEPENING (Tìm kiếm lặp)
         for (int depth = 1; depth <= MAX_DEPTH; depth++) {
@@ -298,7 +298,7 @@ int main() {
             int current_best_score = -INF;
             Move current_best_move = moves[0];
             
-            // ASPIRATION WINDOWS (Cửa sổ khao khát)
+            // ASPIRATION WINDOWS
             int alpha = -INF;
             int beta = INF;
             if (depth >= 4 && completed_depth > 0) {
@@ -325,7 +325,6 @@ int main() {
                 
                 if (break_while || time_is_up) break;
 
-                // Nếu điểm số vượt ra ngoài cửa sổ Aspiration, mở rộng và tìm lại
                 if (current_best_score <= best_score - 50) {
                     beta = alpha + 1;
                     alpha = -INF;
@@ -333,7 +332,7 @@ int main() {
                     alpha = beta - 1;
                     beta = INF;
                 } else {
-                    break; // Thành công trong cửa sổ
+                    break; 
                 }
             }
 
@@ -344,7 +343,8 @@ int main() {
             }
         }
 
-        auto t1 = std::chrono::high_resolution_clock::now();
+        // ĐÃ SỬA: Dùng steady_clock thay vì high_resolution_clock
+        auto t1 = std::chrono::steady_clock::now(); 
         int ms = (int)std::chrono::duration<double, std::milli>(t1 - start_time).count();
         
         std::string uci = uci::moveToUci(best_move);
