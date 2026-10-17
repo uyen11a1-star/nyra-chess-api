@@ -12,6 +12,7 @@ using namespace chess;
 const int PIECE_VALUES[7] = {0, 100, 320, 330, 500, 900, 20000}; 
 const int MATE_SCORE = 100000;
 
+// Khởi tạo ONNX 1 lần duy nhất
 Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "NyraNet");
 Ort::Session* session;
 const char* input_names[] = {"input"};
@@ -79,9 +80,7 @@ void order_moves_with_nn(Board& board, Movelist& moves) {
     for (int i = 0; i < moves.size(); i++) moves[i] = sm[i].m;
 }
 
-long long nodes = 0;
 int negamax(Board& board, int depth, int alpha, int beta, bool root = false) {
-    nodes++;
     if (depth == 0) return evaluate_board(board);
     Movelist moves; movegen::legalmoves(moves, board);
     if (moves.size() == 0) return board.inCheck() ? -MATE_SCORE + depth : 0;
@@ -118,9 +117,10 @@ int main(int argc, char** argv) {
     int best_score = -MATE_SCORE * 2;
     Move best_move = moves[0];
 
+    // GIẢM DEPTH XUỐNG 3 ĐỂ TRÁNH QUÁ TẢI
     for (int i = 0; i < moves.size(); i++) {
         board.makeMove(moves[i]);
-        int score = -negamax(board, 4, -MATE_SCORE * 2, MATE_SCORE * 2);
+        int score = -negamax(board, 3, -MATE_SCORE * 2, MATE_SCORE * 2);
         board.unmakeMove(moves[i]);
         if (score > best_score) { best_score = score; best_move = moves[i]; }
     }
