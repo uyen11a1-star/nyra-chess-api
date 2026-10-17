@@ -1,4 +1,3 @@
-
 import os
 import time
 import threading
@@ -15,13 +14,15 @@ from pydantic import BaseModel, Field
 
 
 # ============================================================
-# NYRA CHESS API 0.3
-# Compatible with the current 18-plane / 4096-policy checkpoint
-# Improved evaluation, move ordering, quiescence and search safety
+# NYRA CHESS API 0.4
+# - Search thật sự chạy được depth 2 trên Render free tier
+# - Policy inference chỉ ở root + 1 tầng, còn lại MVV-LVA
+# - King safety heuristic mạnh hơn: khuyến khích nhập thành,
+#   phạt vua đi lang thang giai đoạn đầu
 # ============================================================
 
 SERVICE_NAME = "Nyra Chess API"
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 
 MODEL_URL = os.getenv("MODEL_URL", "").strip()
 HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
@@ -393,11 +394,9 @@ def evaluate_white_score(board: chess.Board) -> int:
         if piece.piece_type == chess.PAWN:
             value += relative_rank * 5
 
-            # Encourage central pawn presence.
             if file_idx in (3, 4):
                 value += 5
 
-            # Passed-pawn bonus, increasing as it advances.
             enemy_pawns = board.pieces(
                 chess.PAWN, not piece.color
             )
@@ -430,7 +429,6 @@ def evaluate_white_score(board: chess.Board) -> int:
             value += center_bonus(square) // 2
 
         elif piece.piece_type == chess.ROOK:
-            # Small bonus for rooks on open/semi-open files.
             own_pawns = board.pieces(chess.PAWN, piece.color)
             enemy_pawns = board.pieces(chess.PAWN, not piece.color)
 
@@ -448,7 +446,6 @@ def evaluate_white_score(board: chess.Board) -> int:
                 value += 12
 
         elif piece.piece_type == chess.QUEEN:
-            # Avoid encouraging premature queen adventures.
             if board.fullmove_number <= 10:
                 value -= 8
 
@@ -469,22 +466,7 @@ def evaluate_white_score(board: chess.Board) -> int:
 
             score += sign * developed * 10
 
-            king_sq = board.king(color)
-            if king_sq is not None:
-                king_file = chess.square_file(king_sq)
-
-                # Small positional bonus for castled king placement.
-                if king_file in (1, 2, 6):
-                    score += sign * 12
-
-                # Penalize an uncastled king lingering in the centre.
-                elif (
-                    king_file in (3, 4)
-                    and not board.has_castling_rights(color)
-                ):
-                    score -= sign * 12
-
-    # King safety matters more in the middlegame than the endgame.
+    # King safety — stronger castling encouragement.
     endgame = phase <= 6
 
     for color in (chess.WHITE, chess.BLACK):
@@ -496,9 +478,29 @@ def evaluate_white_score(board: chess.Board) -> int:
 
         kf = chess.square_file(king_sq)
         kr = chess.square_rank(king_sq)
+        home_rank = 0 if color == chess.WHITE else 7
+
+        # Bonus cho quyền nhập thành còn lại — khuyến khích giữ
+        rights = 0
+        if board.has_kingside_castling_rights(color):
+            rights += 1
+        if board.has_queenside_castling_rights(color):
+            rights += 1
+        score += sign * rights * 18
+
+        # Phạt nặng nếu vua đi lang thang khỏi hàng nhà khi chưa nhập thành,
+        # trong giai đoạn đầu và trung cuộc.
+        # Vị trí nhập thành hợp lệ: c1/g1 (file 2/6) hoặc c8/g8.
+        if not endgame and board.fullmove_number <= 20:
+            castled_position = (
+                (color == chess.WHITE and kr == 0 and kf in (2, 6))
+                or
+                (color == chess.BLACK and kr == 7 and kf in (2, 6))
+            )
+            if kr != home_rank and not castled_position:
+                score -= sign * 45
 
         if not endgame:
-            # Count friendly pawns in front of the king.
             direction = 1 if color == chess.WHITE else -1
             shield = 0
 
@@ -517,16 +519,13 @@ def evaluate_white_score(board: chess.Board) -> int:
 
             score += sign * shield * 9
 
-            # Penalize a king exposed in the centre during middlegame.
             if kf in (3, 4) and board.fullmove_number > 8:
-                score -= sign * 14
+                score -= sign * 20
 
-            # Penalty if the king is attacked by enemy pieces.
             attackers = board.attackers(not color, king_sq)
             score -= sign * min(3, len(attackers)) * 14
 
         else:
-            # In endgames the king should become active.
             score += sign * center_bonus(king_sq)
 
     # Avoid doubled pawns.
@@ -586,7 +585,6 @@ def move_capture_value(board: chess.Board, move: chess.Move) -> int:
         PIECE_VALUES[attacker.piece_type] if attacker else 0
     )
 
-    # MVV-LVA style ordering: valuable victims first.
     return 10_000 + victim_value * 10 - attacker_value
 
 
@@ -602,7 +600,6 @@ def order_moves(board: chess.Board, moves, logits):
 
         score += move_capture_value(board, move)
 
-        # Prefer checks slightly, without treating them as automatically good.
         board.push(move)
         if board.is_check():
             score += 100
@@ -612,6 +609,23 @@ def order_moves(board: chess.Board, moves, logits):
 
     ranked.sort(key=lambda item: item[0], reverse=True)
     return [move for _, move in ranked]
+
+
+def order_moves_mvv_lva(board: chess.Board, moves):
+    """Fast move ordering — không gọi policy, dùng cho depth sâu / quiescence.
+    MVV-LVA + promotion + check."""
+    def key(move):
+        s = 0.0
+        if move.promotion:
+            s += 5_000 + PIECE_VALUES.get(move.promotion, 0)
+        s += move_capture_value(board, move)
+        board.push(move)
+        if board.is_check():
+            s += 100
+        board.pop()
+        return s
+
+    return sorted(moves, key=key, reverse=True)
 
 
 # ============================================================
@@ -662,7 +676,6 @@ def quiescence(board, alpha, beta, state, ply, remaining):
             return stand_pat
 
     else:
-        # When in check, consider all legal evasions.
         moves = list(board.legal_moves)
 
         if not moves:
@@ -671,8 +684,8 @@ def quiescence(board, alpha, beta, state, ply, remaining):
         if remaining <= 0:
             return evaluate_board(board)
 
-    logits = get_policy_logits(board, model)
-    moves = order_moves(board, moves, logits)
+    # Fast ordering — không gọi policy inference ở đây.
+    moves = order_moves_mvv_lva(board, moves)
 
     for move in moves:
         if should_stop(state):
@@ -725,8 +738,12 @@ def negamax(board, current_model, depth, alpha, beta, state, ply=0):
     if not moves:
         return evaluate_board(board)
 
-    logits = get_policy_logits(board, current_model)
-    moves = order_moves(board, moves, logits)
+    # Policy chỉ dùng ở ply <= 1; các tầng sâu dùng MVV-LVA để tiết kiệm thời gian.
+    if ply <= 1:
+        logits = get_policy_logits(board, current_model)
+        moves = order_moves(board, moves, logits)
+    else:
+        moves = order_moves_mvv_lva(board, moves)
 
     best_score = -INF
 
@@ -799,7 +816,6 @@ def search_best_move(board, current_model, allowed_moves=None):
     best_score = None
     completed_depth = 0
 
-    # Iterative deepening: keep the best move from the last completed depth.
     for depth in range(1, SEARCH_DEPTH + 1):
         if should_stop(state):
             break
@@ -857,7 +873,7 @@ def search_best_move(board, current_model, allowed_moves=None):
         "score": (
             None if best_score is None else int(best_score)
         ),
-        "method": "NyraNet + Evaluation + Negamax/Alpha-Beta",
+        "method": "NyraNet + Evaluation + Negamax/Alpha-Beta (fast order)",
     }
 
 
@@ -1082,4 +1098,4 @@ def debug_predict(fen: str):
         raise HTTPException(
             status_code=500,
             detail=f"{type(exc).__name__}: {exc}",
-        )
+)
