@@ -16,7 +16,7 @@ const int PIECE_VALUES[7] = {0, 100, 320, 330, 500, 900, 20000};
 const int MATE_SCORE = 100000;
 const int INF = 200000;
 
-// --- 2. PIECE SQUARE TABLES (PST) ---
+// --- PIECE SQUARE TABLES (PST) ---
 const int PAWN_PST[64] = {
     0,  0,  0,  0,  0,  0,  0,  0,
     50, 50, 50, 50, 50, 50, 50, 50,
@@ -78,12 +78,20 @@ const int KING_MID_PST[64] = {
      20, 30, 10,  0,  0, 10, 30, 20
 };
 
-// --- OPENING BOOK ---
+// --- MỞ RỘNG OPENING BOOK (Bao gồm cả phản ứng với 1. e4) ---
 std::unordered_map<std::string, std::string> opening_book = {
+    // 1. e4 ...
+    {"rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq -", "e7e5"}, 
+    {"rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq -", "c7c5"},
+    // Ruy Lopez
     {"r1bqkbnr/pppp1ppp/2n5/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R b KQkq -", "a7a6"},
+    // Italian Game
     {"r1bqk1nr/pppp1ppp/2n5/2b1p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq -", "c2c3"},
+    // Sicilian Defense
     {"rnbqkbnr/pp2pppp/3p4/2p5/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq -", "d2d4"},
+    // Queen's Gambit
     {"rnbqkbnr/ppp2ppp/4p3/3p4/2PP4/8/PP2PPPP/RNBQKBNR w KQkq -", "b1c3"},
+    // French Defense
     {"rnbqkbnr/pppp1ppp/4p3/8/3PP3/8/PPP2PPP/RNBQKBNR b KQkq -", "d7d5"}
 };
 
@@ -120,9 +128,6 @@ uint64_t get_hash(const Board& board) {
     return h;
 }
 
-// ============================================================
-// HÀM ĐÁNH GIÁ TÍCH HỢP 7 TIÊU CHÍ
-// ============================================================
 int evaluate_white_score(Board& board) {
     int score = 0;
     int phase = 0;
@@ -138,7 +143,6 @@ int evaluate_white_score(Board& board) {
     }
     bool endgame = (phase <= 6);
 
-    // 1 & 2. Material và PST
     for (int sq = 0; sq < 64; sq++) {
         Piece p = board.at(sq);
         if (p == Piece::NONE) continue;
@@ -155,87 +159,20 @@ int evaluate_white_score(Board& board) {
         else if (p.type() == PieceType::QUEEN) val += QUEEN_PST[pst_sq];
         else if (p.type() == PieceType::KING) val += KING_MID_PST[pst_sq];
 
-        // 5. Phạt quân bị treo
         Square s = static_cast<Square>(sq);
         Color enemy = (p.color() == Color::WHITE) ? Color::BLACK : Color::WHITE;
+
         bool is_attacked = board.isAttacked(s, enemy);
         bool is_defended = board.isAttacked(s, p.color());
         if (is_attacked && !is_defended && p.type() != PieceType::KING) {
             val -= static_cast<int>(PIECE_VALUES[pt_idx] * 0.8);
         }
 
+        if (p.type() == PieceType::QUEEN && board.fullMoveNumber() <= 10) val -= 15;
+
         score += sign * val;
     }
 
-    // 3. Center Control (Kiểm soát trung tâm)
-    int center_squares[] = {27, 28, 35, 36}; // d4, e4, d5, e5
-    for (int sq : center_squares) {
-        Square s = static_cast<Square>(sq);
-        if (board.isAttacked(s, Color::WHITE)) score += 10;
-        if (board.isAttacked(s, Color::BLACK)) score -= 10;
-    }
-
-    // 4. Development (Phát triển quân)
-    if (board.fullMoveNumber() <= 12) {
-        for (int sq = 0; sq < 64; sq++) {
-            Piece p = board.at(sq);
-            if (p == Piece::NONE) continue;
-            
-            int rank = sq / 8;
-            if (p.type() == PieceType::KNIGHT || p.type() == PieceType::BISHOP) {
-                if (p.color() == Color::WHITE && rank == 0) score -= 15; // Chưa phát triển
-                if (p.color() == Color::BLACK && rank == 7) score += 15;
-            }
-            if (p.type() == PieceType::QUEEN) {
-                // Phạt Hậu ra sớm
-                if (p.color() == Color::WHITE && rank > 1 && board.fullMoveNumber() <= 8) score -= 20;
-                if (p.color() == Color::BLACK && rank < 6 && board.fullMoveNumber() <= 8) score += 20;
-            }
-        }
-    }
-
-    // 6. Cấu trúc Tốt (Pawn Structure)
-    for (int file = 0; file < 8; file++) {
-        int w_pawns_on_file = 0, b_pawns_on_file = 0;
-        for (int rank = 0; rank < 8; rank++) {
-            Piece p = board.at(chess::Square(chess::File(file), chess::Rank(rank)));
-            if (p != Piece::NONE && p.type() == PieceType::PAWN) {
-                if (p.color() == Color::WHITE) w_pawns_on_file++;
-                else b_pawns_on_file++;
-            }
-        }
-        if (w_pawns_on_file > 1) score -= 20 * (w_pawns_on_file - 1); // Phạt Tốt chồng
-        if (b_pawns_on_file > 1) score += 20 * (b_pawns_on_file - 1);
-        
-        if (w_pawns_on_file == 1) {
-            bool isolated = true;
-            for (int df = -1; df <= 1; df += 2) {
-                int nf = file + df;
-                if (nf >= 0 && nf < 8) {
-                    for (int rank = 0; rank < 8; rank++) {
-                        Piece p = board.at(chess::Square(chess::File(nf), chess::Rank(rank)));
-                        if (p != Piece::NONE && p.type() == PieceType::PAWN && p.color() == Color::WHITE) isolated = false;
-                    }
-                }
-            }
-            if (isolated) score -= 15; // Phạt Tốt cô lập
-        }
-        if (b_pawns_on_file == 1) {
-            bool isolated = true;
-            for (int df = -1; df <= 1; df += 2) {
-                int nf = file + df;
-                if (nf >= 0 && nf < 8) {
-                    for (int rank = 0; rank < 8; rank++) {
-                        Piece p = board.at(chess::Square(chess::File(nf), chess::Rank(rank)));
-                        if (p != Piece::NONE && p.type() == PieceType::PAWN && p.color() == Color::BLACK) isolated = false;
-                    }
-                }
-            }
-            if (isolated) score += 15;
-        }
-    }
-
-    // 5. An toàn Vua (King Safety) & Cặp Tượng
     int w_bishops = 0, b_bishops = 0;
     for(int sq=0; sq<64; sq++) {
         Piece p = board.at(sq);
@@ -268,12 +205,12 @@ int evaluate_white_score(Board& board) {
                     if (p != Piece::NONE && p.color() == color && p.type() == PieceType::PAWN) shield++;
                 }
             }
-            if (shield == 0) score -= sign * 60; // Mất sạch tốt che chắn
+            if (shield == 0) score -= sign * 60;
             else if (shield == 1) score -= sign * 30;
         }
 
         if (!endgame && board.fullMoveNumber() <= 20 && kr != home_rank && !castled) {
-            score -= sign * 45; // Phạt Vua đi lang thang
+            score -= sign * 45; 
         }
     }
 
@@ -287,16 +224,17 @@ int evaluate_board(Board& board) {
     int score = evaluate_white_score(board);
     int current_score = (board.sideToMove() == Color::WHITE) ? score : -score;
 
-    // Chống lặp (Repetition)
     if (board.isRepetition(2)) {
         if (current_score > 100) return -500; 
         if (current_score < -100) return 50;
         return 0;
     }
 
+    // Đã xóa Random Noise để AI chơi nghiêm túc hơn
     return current_score;
 }
 
+// --- SỬA LỖI SẮP XẾP NƯỚC ĐI (Bỏ ưu tiên 500 điểm vô lý) ---
 void order_moves(Board& board, Movelist& moves) {
     struct SM { Move m; int s; };
     std::vector<SM> sm;
@@ -306,17 +244,15 @@ void order_moves(Board& board, Movelist& moves) {
         Move move = moves[i];
         int score = 0;
         
+        // 1. Ưu tiên ăn quân (MVV-LVA)
         if (board.isCapture(move)) {
             Piece victim = board.at(move.to());
             if (victim != Piece::NONE) score += 10000 + 10 * PIECE_VALUES[static_cast<int>(victim.type())] - PIECE_VALUES[static_cast<int>(board.at(move.from()).type())];
             else score += 10000; 
         }
         
+        // 2. Ưu tiên phong cấp
         if (move.promotionType() != PieceType::NONE) score += 9000;
-        
-        int from_rank = move.from().index() / 8;
-        if (board.sideToMove() == Color::WHITE && from_rank == 0) score += 500;
-        if (board.sideToMove() == Color::BLACK && from_rank == 7) score += 500;
 
         sm.push_back({move, score});
     }
@@ -436,7 +372,7 @@ std::string extract_fen(const std::string& body) {
 
 int main() {
     init_zobrist();
-    std::cout << "Khởi động Nyra Engine (Full 7 Heuristics)..." << std::endl;
+    std::cout << "Khởi động Nyra Engine..." << std::endl;
 
     httplib::Server svr;
 
@@ -455,6 +391,7 @@ int main() {
                 res.status = 400; res.set_content("{\"error\":\"No FEN\"}", "application/json"); return;
             }
 
+            // Rút gọn FEN để so sánh với Opening Book
             std::string fen_short = fen.substr(0, fen.find_last_of(" "));
             fen_short = fen_short.substr(0, fen_short.find_last_of(" ")); 
             
@@ -465,6 +402,7 @@ int main() {
                 res.set_content("{\"uci\":\"NONE\"}", "application/json"); return;
             }
 
+            // Kiểm tra Opening Book
             if (opening_book.find(fen_short) != opening_book.end()) {
                 std::string book_move_uci = opening_book[fen_short];
                 for (int i = 0; i < moves.size(); i++) {
