@@ -94,7 +94,7 @@ long long total_nodes = 0;
 
 const int TIME_LIMIT_MS = 15000; 
 const int MAX_DEPTH = 10; 
-const int MAX_Q_DEPTH = 4; 
+const int MAX_Q_DEPTH = 6; // Tăng độ sâu tĩnh lặng lên 6
 
 void init_zobrist() {
     std::mt19937_64 rng(12345);
@@ -185,18 +185,12 @@ int evaluate_white_score(Board& board) {
 
         if (board.fullMoveNumber() <= 10 && p.type() == PieceType::QUEEN) val -= 20;
 
-        // SỬA LỖI CHIẾM TRUNG TÂM BẰNG TỐT: Thưởng điểm cực mạnh cho Tốt d/e
-        if (p.type() == PieceType::PAWN) {
-            int file = (p.color() == Color::WHITE) ? (sq % 8) : ((sq ^ 56) % 8);
-            int rank = (p.color() == Color::WHITE) ? (sq / 8) : ((sq ^ 56) / 8);
-            // Nếu Tốt cột d hoặc e tiến lên (hàng 3, 4, 5)
-            if ((file == 3 || file == 4) && rank > 1) {
-                val += 40; 
-            }
-            // Phạt nếu Tốt d/e vẫn đứng ở hàng 2 (chưa chiếm trung tâm) sau nước thứ 10
-            if ((file == 3 || file == 4) && rank == 1 && board.fullMoveNumber() > 10 && !endgame) {
-                val -= 30;
-            }
+        // SỬA LỖI: Thưởng điểm tấn công Vua (King Attack)
+        Square enemy_king = board.kingSq(enemy);
+        if (enemy_king != Square::underlying::NO_SQ) {
+            int dist = std::abs((s.index() % 8) - (enemy_king.index() % 8)) + 
+                       std::abs((s.index() / 8) - (enemy_king.index() / 8));
+            if (dist <= 2) val += 15; // Quân áp sát Vua địch
         }
 
         score += sign * val;
@@ -277,6 +271,9 @@ void order_moves(Board& board, Movelist& moves) {
         }
         
         if (move.promotionType() != PieceType::NONE) score += 9000;
+        
+        // Ưu tiên nước chiếu tướng
+        if (static_cast<int>(board.givesCheck(move)) != 0) score += 5000;
 
         sm.push_back({move, score});
     }
@@ -284,6 +281,7 @@ void order_moves(Board& board, Movelist& moves) {
     for (int i = 0; i < moves.size(); i++) moves[i] = sm[i].m;
 }
 
+// --- SỬA LỖI: QUIESCENCE DUYỆT CẢ NƯỚC CHIẾU TƯỚNG ---
 int quiescence(Board& board, int alpha, int beta, int depth) {
     if (time_is_up) return evaluate_board(board);
     
@@ -311,7 +309,9 @@ int quiescence(Board& board, int alpha, int beta, int depth) {
 
     Movelist search_moves;
     for(int i=0; i<moves.size(); i++) {
-        if (in_check || board.isCapture(moves[i])) {
+        // Nếu đang bị chiếu, duyệt mọi nước. 
+        // Nếu không bị chiếu, duyệt nước ăn quân HOẶC nước chiếu tướng
+        if (in_check || board.isCapture(moves[i]) || static_cast<int>(board.givesCheck(moves[i])) != 0) {
             search_moves.add(moves[i]);
         }
     }
@@ -425,7 +425,7 @@ std::string extract_fen(const std::string& body) {
 
 int main() {
     init_zobrist();
-    std::cout << "Khởi động Nyra Engine..." << std::endl;
+    std::cout << "Khởi động Nyra Engine (Sát Thủ Chiếu Hết)..." << std::endl;
 
     httplib::Server svr;
 
