@@ -78,6 +78,24 @@ const int KING_MID_PST[64] = {
      20, 30, 10,  0,  0, 10, 30, 20
 };
 
+// --- OPENING BOOK ---
+std::unordered_map<std::string, std::string> opening_book = {
+    // Khai cuộc 1. e4 ...
+    {"rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq -", "e7e5"},
+    {"rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq -", "c7c5"},
+    // Khai cuộc 1. d4 ...
+    {"rnbqkbnr/pppppppp/8/8/3P4/8/PPP1PPPP/RNBQKBNR b KQkq -", "d7d5"},
+    {"rnbqkbnr/pppppppp/8/8/3P4/8/PPP1PPPP/RNBQKBNR b KQkq -", "g8f6"},
+    // Khai cuộc Ý
+    {"r1bqk1nr/pppp1ppp/2n5/2b1p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq -", "c2c3"},
+    // Ruy Lopez
+    {"r1bqkbnr/pppp1ppp/2n5/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R b KQkq -", "a7a6"},
+    // Sicilian
+    {"rnbqkbnr/pp2pppp/3p4/2p5/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq -", "d2d4"},
+    // Pháp
+    {"rnbqkbnr/pppp1ppp/4p3/8/3PP3/8/PPP2PPP/RNBQKBNR b KQkq -", "d7d5"}
+};
+
 // --- ZOBRIST HASHING ---
 uint64_t zobrist_pieces[7][2][64];
 uint64_t zobrist_turn;
@@ -142,9 +160,6 @@ uint64_t get_hash(const Board& board) {
     return h;
 }
 
-// ============================================================
-// HÀM ĐÁNH GIÁ NÂNG CAO (GIAI ĐOẠN 2)
-// ============================================================
 int evaluate_white_score(Board& board) {
     int score = 0;
     int phase = 0;
@@ -180,7 +195,6 @@ int evaluate_white_score(Board& board) {
         Square s = static_cast<Square>(sq);
         Color enemy = (p.color() == Color::WHITE) ? Color::BLACK : Color::WHITE;
 
-        // Phạt quân bị treo
         bool is_attacked = board.isAttacked(s, enemy);
         bool is_defended = board.isAttacked(s, p.color());
         if (is_attacked && !is_defended && p.type() != PieceType::KING) {
@@ -189,7 +203,6 @@ int evaluate_white_score(Board& board) {
 
         if (board.fullMoveNumber() <= 10 && p.type() == PieceType::QUEEN) val -= 20;
 
-        // Thưởng điểm tấn công Vua
         Square enemy_king = board.kingSq(enemy);
         if (enemy_king != Square::underlying::NO_SQ) {
             int dist = std::abs((s.index() % 8) - (enemy_king.index() % 8)) + 
@@ -211,7 +224,7 @@ int evaluate_white_score(Board& board) {
     if (w_bishops >= 2) score += 35;
     if (b_bishops >= 2) score -= 35;
 
-    // 3. Cấu trúc Tốt & Tốt thông (Passed Pawn)
+    // 3. Cấu trúc Tốt & Tốt thông
     for (int file = 0; file < 8; file++) {
         int w_pawns = 0, b_pawns = 0;
         for (int rank = 0; rank < 8; rank++) {
@@ -221,7 +234,7 @@ int evaluate_white_score(Board& board) {
                 else b_pawns++;
             }
         }
-        if (w_pawns > 1) score -= 20 * (w_pawns - 1); // Tốt chồng
+        if (w_pawns > 1) score -= 20 * (w_pawns - 1);
         if (b_pawns > 1) score += 20 * (b_pawns - 1);
     }
 
@@ -234,7 +247,6 @@ int evaluate_white_score(Board& board) {
         int rank = sq / 8;
         int rel_rank = (p.color() == Color::WHITE) ? rank : (7 - rank);
         
-        // Kiểm tra Tốt thông (Passed Pawn)
         bool is_passed = true;
         for (int df = -1; df <= 1; df++) {
             int nf = file + df;
@@ -250,13 +262,12 @@ int evaluate_white_score(Board& board) {
         }
         
         if (is_passed) {
-            // Thưởng điểm tăng dần theo cấp bậc của Tốt
             if (rel_rank >= 2) score += sign * (rel_rank * 15);
-            if (rel_rank == 6) score += sign * 50; // Sát nút phong cấp
+            if (rel_rank == 6) score += sign * 50;
         }
     }
 
-    // 4. Xe trên cột mở / bán mở
+    // 4. Xe trên cột mở
     for (int sq = 0; sq < 64; sq++) {
         Piece p = board.at(sq);
         if (p == Piece::NONE || p.type() != PieceType::ROOK) continue;
@@ -275,14 +286,14 @@ int evaluate_white_score(Board& board) {
             }
         }
         
-        if (!own_pawn_on_file && !enemy_pawn_on_file) score += sign * 25; // Cột mở
-        else if (!own_pawn_on_file && enemy_pawn_on_file) score += sign * 15; // Cột bán mở
+        if (!own_pawn_on_file && !enemy_pawn_on_file) score += sign * 25;
+        else if (!own_pawn_on_file && enemy_pawn_on_file) score += sign * 15;
         
         int rel_rank = (p.color() == Color::WHITE) ? rank : (7 - rank);
-        if (rel_rank == 6) score += sign * 30; // Xe ở hàng 7
+        if (rel_rank == 6) score += sign * 30;
     }
 
-    // 5. Mã tiền đồn (Knight Outpost)
+    // 5. Mã tiền đồn
     for (int sq = 0; sq < 64; sq++) {
         Piece p = board.at(sq);
         if (p == Piece::NONE || p.type() != PieceType::KNIGHT) continue;
@@ -293,13 +304,11 @@ int evaluate_white_score(Board& board) {
 
         if (rel_rank >= 2 && rel_rank <= 5) {
             Square s = static_cast<Square>(sq);
-            if (board.isAttacked(s, p.color())) {
-                score += sign * 20;
-            }
+            if (board.isAttacked(s, p.color())) score += sign * 20;
         }
     }
 
-    // 6. An toàn Vua (Nâng cao)
+    // 6. An toàn Vua
     for (Color color : {Color::WHITE, Color::BLACK}) {
         int sign = (color == Color::WHITE) ? 1 : -1;
         Square k_sq = board.kingSq(color);
@@ -328,6 +337,39 @@ int evaluate_white_score(Board& board) {
 
         if (!endgame && board.fullMoveNumber() <= 20 && kr != home_rank && !castled) {
             score -= sign * 45; 
+        }
+    }
+
+    // 7. ENDGAME MATE DRIVE (Dắt Vua tàn cuộc)
+    if (endgame) {
+        if (score > 300) {
+            Square bk = board.kingSq(Color::BLACK);
+            if (bk != Square::underlying::NO_SQ) {
+                int bf = bk.index() % 8;
+                int br = bk.index() / 8;
+                int edge_dist = std::min(std::min(bf, 7 - bf), std::min(br, 7 - br));
+                score += (7 - edge_dist) * 20; // Ép Vua đen ra biên
+                
+                Square wk = board.kingSq(Color::WHITE);
+                if (wk != Square::underlying::NO_SQ) {
+                    int dist = std::abs((wk.index() % 8) - bf) + std::abs((wk.index() / 8) - br);
+                    score += (14 - dist) * 10; // Kéo Vua trắng lại gần
+                }
+            }
+        } else if (score < -300) {
+            Square wk = board.kingSq(Color::WHITE);
+            if (wk != Square::underlying::NO_SQ) {
+                int wf = wk.index() % 8;
+                int wr = wk.index() / 8;
+                int edge_dist = std::min(std::min(wf, 7 - wf), std::min(wr, 7 - wr));
+                score -= (7 - edge_dist) * 20; // Ép Vua trắng ra biên
+                
+                Square bk = board.kingSq(Color::BLACK);
+                if (bk != Square::underlying::NO_SQ) {
+                    int dist = std::abs((wk.index() % 8) - (bk.index() % 8)) + std::abs((wk.index() / 8) - (bk.index() / 8));
+                    score -= (14 - dist) * 10;
+                }
+            }
         }
     }
 
@@ -365,7 +407,6 @@ void order_moves(Board& board, Movelist& moves) {
         }
         
         if (move.promotionType() != PieceType::NONE) score += 9000;
-        
         if (static_cast<int>(board.givesCheck(move)) != 0) score += 5000;
 
         sm.push_back({move, score});
@@ -515,7 +556,7 @@ std::string extract_fen(const std::string& body) {
 
 int main() {
     init_zobrist();
-    std::cout << "Khởi động Nyra Engine (Giai đoạn 2: Eval Nâng Cao)..." << std::endl;
+    std::cout << "Khởi động Nyra Engine (Giai đoạn 3: Book + Endgame)..." << std::endl;
 
     httplib::Server svr;
 
@@ -544,6 +585,10 @@ int main() {
                 res.status = 400; res.set_content("{\"error\":\"No FEN\"}", "application/json"); return;
             }
 
+            // Lấy FEN rút gọn để so sánh với Opening Book
+            std::string fen_short = fen.substr(0, fen.find_last_of(" "));
+            fen_short = fen_short.substr(0, fen_short.find_last_of(" ")); 
+
             Board board = Board(fen);
             Movelist moves; 
             movegen::legalmoves(moves, board);
@@ -552,6 +597,18 @@ int main() {
                 res.set_content("{\"uci\":\"NONE\"}", "application/json"); return;
             }
 
+            // 1. Kiểm tra Opening Book trước
+            if (opening_book.find(fen_short) != opening_book.end()) {
+                std::string book_move_uci = opening_book[fen_short];
+                for (int i = 0; i < moves.size(); i++) {
+                    if (uci::moveToUci(moves[i]) == book_move_uci) {
+                        res.set_content("{\"uci\":\"" + book_move_uci + "\", \"search\":{\"depth\":0, \"method\":\"Opening Book\"}}", "application/json");
+                        return;
+                    }
+                }
+            }
+
+            // 2. Nếu không có trong sách, chạy thuật toán Search
             transposition_table.clear();
             transposition_table.reserve(200000); 
             order_moves(board, moves);
