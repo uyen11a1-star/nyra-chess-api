@@ -92,10 +92,9 @@ std::chrono::steady_clock::time_point start_time;
 bool time_is_up = false;
 long long total_nodes = 0;
 
-// TĂNG THỜI GIAN LÊN 15 GIÂY VÀ ĐỘ SÂU LÊN 10
 const int TIME_LIMIT_MS = 15000; 
 const int MAX_DEPTH = 10; 
-const int MAX_Q_DEPTH = 4; // Giới hạn độ sâu của Quiescence
+const int MAX_Q_DEPTH = 4; 
 
 void init_zobrist() {
     std::mt19937_64 rng(12345);
@@ -119,7 +118,6 @@ uint64_t get_hash(const Board& board) {
     }
     if (board.sideToMove() == Color::WHITE) h ^= zobrist_turn;
     
-    // Tránh lỗi compile bằng cách dùng FEN string cho Castling và EP
     std::string fen = board.getFen();
     size_t space1 = fen.find(' ');
     if (space1 != std::string::npos) {
@@ -181,12 +179,25 @@ int evaluate_white_score(Board& board) {
         bool is_attacked = board.isAttacked(s, enemy);
         bool is_defended = board.isAttacked(s, p.color());
         
-        // Phạt quân bị treo (bị tấn công mà không được bảo vệ)
         if (is_attacked && !is_defended && p.type() != PieceType::KING) {
             val -= static_cast<int>(PIECE_VALUES[pt_idx] * 0.9);
         }
 
         if (board.fullMoveNumber() <= 10 && p.type() == PieceType::QUEEN) val -= 20;
+
+        // SỬA LỖI CHIẾM TRUNG TÂM BẰNG TỐT: Thưởng điểm cực mạnh cho Tốt d/e
+        if (p.type() == PieceType::PAWN) {
+            int file = (p.color() == Color::WHITE) ? (sq % 8) : ((sq ^ 56) % 8);
+            int rank = (p.color() == Color::WHITE) ? (sq / 8) : ((sq ^ 56) / 8);
+            // Nếu Tốt cột d hoặc e tiến lên (hàng 3, 4, 5)
+            if ((file == 3 || file == 4) && rank > 1) {
+                val += 40; 
+            }
+            // Phạt nếu Tốt d/e vẫn đứng ở hàng 2 (chưa chiếm trung tâm) sau nước thứ 10
+            if ((file == 3 || file == 4) && rank == 1 && board.fullMoveNumber() > 10 && !endgame) {
+                val -= 30;
+            }
+        }
 
         score += sign * val;
     }
@@ -273,7 +284,6 @@ void order_moves(Board& board, Movelist& moves) {
     for (int i = 0; i < moves.size(); i++) moves[i] = sm[i].m;
 }
 
-// --- SỬA LỖI 1 & 4: QUIESCENCE CÓ GIỚI HẠN ĐỘ SÂU VÀ CHECK TIME ---
 int quiescence(Board& board, int alpha, int beta, int depth) {
     if (time_is_up) return evaluate_board(board);
     
@@ -294,7 +304,6 @@ int quiescence(Board& board, int alpha, int beta, int depth) {
         if (alpha < stand_pat) alpha = stand_pat;
     }
 
-    // Nếu đạt giới hạn độ sâu Quiescence, trả về đánh giá hiện tại
     if (depth == 0) return evaluate_board(board);
 
     Movelist moves; movegen::legalmoves(moves, board);
@@ -416,7 +425,7 @@ std::string extract_fen(const std::string& body) {
 
 int main() {
     init_zobrist();
-    std::cout << "Khởi động Nyra Engine (Siêu Suy Luận 15s)..." << std::endl;
+    std::cout << "Khởi động Nyra Engine..." << std::endl;
 
     httplib::Server svr;
 
