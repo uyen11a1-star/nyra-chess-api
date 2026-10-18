@@ -88,13 +88,16 @@ enum TTFlag { EXACT, LOWERBOUND, UPPERBOUND };
 struct TTEntry { int depth; int score; TTFlag flag; Move best_move; };
 std::unordered_map<uint64_t, TTEntry> transposition_table;
 
+// --- KILLER MOVES (Lưu 2 nước đi sát thủ cho mỗi tầng) ---
+Move killer_moves[100][2];
+
 std::chrono::steady_clock::time_point start_time;
 bool time_is_up = false;
 long long total_nodes = 0;
 
 const int TIME_LIMIT_MS = 15000; 
-const int MAX_DEPTH = 10; 
-const int MAX_Q_DEPTH = 6; // Tăng độ sâu tĩnh lặng lên 6
+const int MAX_DEPTH = 15; // Tăng trần độ sâu vì đã có cắt tỉa
+const int MAX_Q_DEPTH = 6; 
 
 void init_zobrist() {
     std::mt19937_64 rng(12345);
@@ -185,12 +188,11 @@ int evaluate_white_score(Board& board) {
 
         if (board.fullMoveNumber() <= 10 && p.type() == PieceType::QUEEN) val -= 20;
 
-        // SỬA LỖI: Thưởng điểm tấn công Vua (King Attack)
         Square enemy_king = board.kingSq(enemy);
         if (enemy_king != Square::underlying::NO_SQ) {
             int dist = std::abs((s.index() % 8) - (enemy_king.index() % 8)) + 
                        std::abs((s.index() / 8) - (enemy_king.index() / 8));
-            if (dist <= 2) val += 15; // Quân áp sát Vua địch
+            if (dist <= 2) val += 15; 
         }
 
         score += sign * val;
@@ -255,7 +257,7 @@ int evaluate_board(Board& board) {
     return current_score;
 }
 
-void order_moves(Board& board, Movelist& moves) {
+void order_moves(Board& board, Movelist& moves, int ply) {
     struct SM { Move m; int s; };
     std::vector<SM> sm;
     sm.reserve(moves.size());
@@ -264,16 +266,24 @@ void order_moves(Board& board, Movelist& moves) {
         Move move = moves[i];
         int score = 0;
         
+        // 1. Ưu tiên ăn quân (MVV-LVA)
         if (board.isCapture(move)) {
             Piece victim = board.at(move.to());
             if (victim != Piece::NONE) score += 10000 + 10 * PIECE_VALUES[static_cast<int>(victim.type())] - PIECE_VALUES[static_cast<int>(board.at(move.from()).type())];
             else score += 10000; 
         }
         
+        // 2. Ưu tiên phong cấp
         if (move.promotionType() != PieceType::NONE) score += 9000;
         
-        // Ưu tiên nước chiếu tướng
+        // 3. Ưu tiên nước chiếu tướng
         if (static_cast<int>(board.givesCheck(move)) != 0) score += 5000;
+        
+        // 4. Ưu tiên Killer Moves
+        if (ply < 100) {
+            if (move == killer_moves[ply][0]) score += 4000;
+            else if (move == killer_moves[ply][1]) score += 3000;
+        }
 
         sm.push_back({move, score});
     }
@@ -281,7 +291,6 @@ void order_moves(Board& board, Movelist& moves) {
     for (int i = 0; i < moves.size(); i++) moves[i] = sm[i].m;
 }
 
-// --- SỬA LỖI: QUIESCENCE DUYỆT CẢ NƯỚC CHIẾU TƯỚNG ---
 int quiescence(Board& board, int alpha, int beta, int depth) {
     if (time_is_up) return evaluate_board(board);
     
@@ -309,14 +318,13 @@ int quiescence(Board& board, int alpha, int beta, int depth) {
 
     Movelist search_moves;
     for(int i=0; i<moves.size(); i++) {
-        // Nếu đang bị chiếu, duyệt mọi nước. 
-        // Nếu không bị chiếu, duyệt nước ăn quân HOẶC nước chiếu tướng
         if (in_check || board.isCapture(moves[i]) || static_cast<int>(board.givesCheck(moves[i])) != 0) {
             search_moves.add(moves[i]);
         }
     }
     
-    order_moves(board, search_moves);
+    // Gọi order_moves với ply = 99 để không dùng killer moves trong quiescence
+    order_moves(board, search_moves, 99);
 
     for (int i = 0; i < search_moves.size(); i++) {
         board.makeMove(search_moves[i]);
@@ -328,7 +336,7 @@ int quiescence(Board& board, int alpha, int beta, int depth) {
     return alpha;
 }
 
-int negamax(Board& board, int depth, int alpha, int beta) {
+int negamax(Board& board, int depth, int alpha, int beta, int ply) {
     if (time_is_up) return evaluate_board(board);
 
     total_nodes++;
@@ -356,10 +364,20 @@ int negamax(Board& board, int depth, int alpha, int beta) {
         }
     }
 
+    // --- NULL MOVE PRUNING ---
+    if (!in_check && depth >= 3 && beta - alpha == 1) {
+        // Tạo nước đi Null (nhường lượt)
+        board.makeMove(Move::make(Square::underlying::NO_SQ, Square::underlying::NO_SQ));
+        int score = -negamax(board, depth - 3, -beta, -beta + 1, ply + 1);
+        board.unmakeMove(Move::make(Square::underlying::NO_SQ, Square::underlying::NO_SQ));
+        
+        if (score >= beta) return beta; // Cắt tỉa nếu nhường lượt mà vẫn an toàn
+    }
+
     Movelist moves; movegen::legalmoves(moves, board);
     if (moves.size() == 0) return in_check ? -MATE_SCORE + depth : 0;
     
-    order_moves(board, moves);
+    order_moves(board, moves, ply);
     
     int best = -INF;
     Move best_move_in_node = moves[0];
@@ -374,19 +392,22 @@ int negamax(Board& board, int depth, int alpha, int beta) {
         int extension = board.inCheck() ? 1 : 0;
         int new_depth = depth - 1 + extension;
 
+        // --- LATE MOVE REDUCTIONS (LMR) ---
+        // Giảm độ sâu ở các nước đi sau, không ăn quân, không chiếu tướng
         if (i >= 3 && depth >= 3 && !in_check && !is_capture && !gives_check) {
             new_depth -= 1; 
         }
 
         int score;
         if (i == 0) {
-            score = -negamax(board, new_depth, -beta, -alpha);
+            score = -negamax(board, new_depth, -beta, -alpha, ply + 1);
         } else {
-            score = -negamax(board, new_depth, -alpha - 1, -alpha);
+            score = -negamax(board, new_depth, -alpha - 1, -alpha, ply + 1);
+            // Nếu nước bị giảm độ sâu mà bất ngờ tốt, tính lại ở độ sâu đầy đủ
             if (score > alpha && new_depth < depth - 1 + extension) {
-                score = -negamax(board, depth - 1 + extension, -beta, -alpha);
+                score = -negamax(board, depth - 1 + extension, -beta, -alpha, ply + 1);
             } else if (score > alpha && score < beta) {
-                score = -negamax(board, depth - 1 + extension, -beta, -alpha);
+                score = -negamax(board, depth - 1 + extension, -beta, -alpha, ply + 1);
             }
         }
         board.unmakeMove(moves[i]);
@@ -401,6 +422,13 @@ int negamax(Board& board, int depth, int alpha, int beta) {
         }
         if (alpha >= beta) {
             flag = LOWERBOUND;
+            // Lưu Killer Move
+            if (!is_capture && ply < 100) {
+                if (killer_moves[ply][0] != moves[i]) {
+                    killer_moves[ply][1] = killer_moves[ply][0];
+                    killer_moves[ply][0] = moves[i];
+                }
+            }
             break;
         }
     }
@@ -425,7 +453,7 @@ std::string extract_fen(const std::string& body) {
 
 int main() {
     init_zobrist();
-    std::cout << "Khởi động Nyra Engine (Sát Thủ Chiếu Hết)..." << std::endl;
+    std::cout << "Khởi động Nyra Engine (Giai đoạn 1: Search Optimization)..." << std::endl;
 
     httplib::Server svr;
 
@@ -464,7 +492,14 @@ int main() {
 
             transposition_table.clear();
             transposition_table.reserve(200000); 
-            order_moves(board, moves);
+            
+            // Reset Killer Moves
+            for (int i = 0; i < 100; i++) {
+                killer_moves[i][0] = Move();
+                killer_moves[i][1] = Move();
+            }
+            
+            order_moves(board, moves, 0);
             
             int best_score = -INF;
             Move best_move = moves[0];
@@ -485,7 +520,7 @@ int main() {
 
                 for (int i = 0; i < moves.size(); i++) {
                     board.makeMove(moves[i]);
-                    int score = -negamax(board, depth - 1, -beta, -alpha);
+                    int score = -negamax(board, depth - 1, -beta, -alpha, 1);
                     board.unmakeMove(moves[i]);
 
                     if (time_is_up) break;
