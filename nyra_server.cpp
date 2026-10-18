@@ -28,10 +28,10 @@ const int PAWN_PST[64] = {
      0,  0,  0,  0,  0,  0,  0,  0
 };
 const int KNIGHT_PST[64] = {
-    -100,-100,-100,-100,-100,-100,-100,-100, // Phạt nặng Mã ra biên
+    -100,-100,-100,-100,-100,-100,-100,-100, 
     -100,-20,  0,  0,  0,  0,-20,-100,
     -100,  0, 10, 15, 15, 10,  0,-100,
-    -100,  5, 15, 30, 30, 15,  5,-100, // Trung tâm được thưởng
+    -100,  5, 15, 30, 30, 15,  5,-100, 
     -100,  0, 15, 30, 30, 15,  0,-100,
     -100,  5, 10, 15, 15, 10,  5,-100,
     -100,-20,  0,  5,  5,  0,-20,-100,
@@ -86,7 +86,7 @@ std::unordered_map<uint64_t, TTEntry> transposition_table;
 
 std::chrono::steady_clock::time_point start_time;
 bool time_is_up = false;
-const int TIME_LIMIT_MS = 3000; // 3 giây
+const int TIME_LIMIT_MS = 3000; 
 const int MAX_DEPTH = 6; 
 
 void init_zobrist() {
@@ -147,8 +147,28 @@ int evaluate_white_score(Board& board) {
 
         bool is_attacked = board.isAttacked(s, enemy);
         bool is_defended = board.isAttacked(s, p.color());
+        
+        // Phạt quân bị treo
         if (is_attacked && !is_defended && p.type() != PieceType::KING) {
             val -= static_cast<int>(PIECE_VALUES[pt_idx] * 0.8);
+        }
+
+        // Phạt Tốt bị bỏ rơi (không có Tốt bên cạnh bảo vệ) ở giai đoạn đầu
+        if (p.type() == PieceType::PAWN && !endgame) {
+            int file = (sq % 8);
+            bool has_pawn_neighbor = false;
+            for (int df = -1; df <= 1; df += 2) {
+                int nf = file + df;
+                if (nf >= 0 && nf < 8) {
+                    for (int r = 0; r < 8; r++) {
+                        Piece neighbor = board.at(chess::Square(chess::File(nf), chess::Rank(r)));
+                        if (neighbor != Piece::NONE && neighbor.type() == PieceType::PAWN && neighbor.color() == p.color()) {
+                            has_pawn_neighbor = true;
+                        }
+                    }
+                }
+            }
+            if (!has_pawn_neighbor) val -= 15; // Phạt Tốt cô lập
         }
 
         if (board.fullMoveNumber() <= 10 && p.type() == PieceType::QUEEN) val -= 20;
@@ -213,6 +233,46 @@ int evaluate_board(Board& board) {
         return 0;
     }
     return current_score;
+}
+
+// --- HÀM LỌC NƯỚC ĐI (LOẠI BỎ NƯỚC NGU) ---
+Movelist get_safe_moves(Board& board) {
+    Movelist all_moves;
+    movegen::legalmoves(all_moves, board);
+    Movelist safe_moves;
+
+    for (int i = 0; i < all_moves.size(); i++) {
+        Move move = all_moves[i];
+        bool is_bad = false;
+
+        // Nếu là 15 nước đầu tiên
+        if (board.fullMoveNumber() <= 15) {
+            Piece p = board.at(move.from());
+            int to_file = move.to().index() % 8;
+            
+            // 1. Cấm Mã ra biên
+            if (p != Piece::NONE && p.type() == PieceType::KNIGHT) {
+                if (to_file == 0 || to_file == 7) {
+                    is_bad = true;
+                }
+            }
+            // 2. Cấm đẩy Tốt biên (a, h)
+            if (p != Piece::NONE && p.type() == PieceType::PAWN && !board.isCapture(move)) {
+                int from_file = move.from().index() % 8;
+                if (from_file == 0 || from_file == 7) {
+                    is_bad = true;
+                }
+            }
+        }
+
+        if (!is_bad) {
+            safe_moves.add(move);
+        }
+    }
+
+    // Nếu cấm hết không còn nước nào (hiếm), trả về tất cả
+    if (safe_moves.size() == 0) return all_moves;
+    return safe_moves;
 }
 
 void order_moves(Board& board, Movelist& moves) {
@@ -290,7 +350,10 @@ int negamax(Board& board, int depth, int alpha, int beta, bool root = false) {
         }
     }
 
-    Movelist moves; movegen::legalmoves(moves, board);
+    Movelist moves;
+    if (root) moves = get_safe_moves(board); // Chỉ dùng nước an toàn ở gốc
+    else movegen::legalmoves(moves, board);
+    
     if (moves.size() == 0) return in_check ? -MATE_SCORE + depth : 0;
     
     order_moves(board, moves);
@@ -355,7 +418,7 @@ std::string extract_fen(const std::string& body) {
 
 int main() {
     init_zobrist();
-    std::cout << "Khởi động Nyra Engine (Pure C++)..." << std::endl;
+    std::cout << "Khởi động Nyra Engine (Bản Cấm Nước Ngớ Ngẩn)..." << std::endl;
 
     httplib::Server svr;
 
@@ -385,7 +448,9 @@ int main() {
             }
 
             Board board = Board(fen);
-            Movelist moves; movegen::legalmoves(moves, board);
+            
+            // Lấy danh sách nước đi đã qua bộ lọc
+            Movelist moves = get_safe_moves(board);
             
             if (moves.size() == 0) {
                 res.set_content("{\"uci\":\"NONE\"}", "application/json"); return;
