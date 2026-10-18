@@ -78,22 +78,30 @@ const int KING_MID_PST[64] = {
      20, 30, 10,  0,  0, 10, 30, 20
 };
 
-// --- OPENING BOOK ---
+// --- MỞ RỘNG OPENING BOOK (Gambits & Standard) ---
 std::unordered_map<std::string, std::string> opening_book = {
-    // Khai cuộc 1. e4 ...
+    // 1. e4 e5
     {"rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq -", "e7e5"},
-    {"rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq -", "c7c5"},
-    // Khai cuộc 1. d4 ...
-    {"rnbqkbnr/pppppppp/8/8/3P4/8/PPP1PPPP/RNBQKBNR b KQkq -", "d7d5"},
-    {"rnbqkbnr/pppppppp/8/8/3P4/8/PPP1PPPP/RNBQKBNR b KQkq -", "g8f6"},
-    // Khai cuộc Ý
-    {"r1bqk1nr/pppp1ppp/2n5/2b1p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq -", "c2c3"},
-    // Ruy Lopez
+    // King's Gambit (1. e4 e5 2. f4)
+    {"rnbqkbnr/pppp1ppp/8/4p3/4PP2/8/PPPP2PP/RNBQKBNR b KQkq f3", "e5f4"},
+    // Italian Game (1. e4 e5 2. Nf3 Nc6 3. Bc4)
+    {"r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R b KQkq -", "f8c5"},
+    // Ruy Lopez (1. e4 e5 2. Nf3 Nc6 3. Bb5)
     {"r1bqkbnr/pppp1ppp/2n5/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R b KQkq -", "a7a6"},
-    // Sicilian
+    // 1. e4 c5 (Sicilian)
+    {"rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq -", "c7c5"},
+    // Sicilian Open (1. e4 c5 2. Nf3 d6 3. d4)
     {"rnbqkbnr/pp2pppp/3p4/2p5/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq -", "d2d4"},
-    // Pháp
-    {"rnbqkbnr/pppp1ppp/4p3/8/3PP3/8/PPP2PPP/RNBQKBNR b KQkq -", "d7d5"}
+    // 1. e4 e6 (French)
+    {"rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq -", "e7e6"},
+    // 1. e4 c6 (Caro-Kann)
+    {"rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq -", "c7c6"},
+    // 1. d4 d5
+    {"rnbqkbnr/pppppppp/8/8/3P4/8/PPP1PPPP/RNBQKBNR b KQkq -", "d7d5"},
+    // Queen's Gambit (1. d4 d5 2. c4)
+    {"rnbqkbnr/ppp1pppp/8/3p4/2PP4/8/PP2PPPP/RNBQKBNR b KQkq c3", "e7e6"},
+    // Queen's Gambit Accepted (1. d4 d5 2. c4 dxc4)
+    {"rnbqkbnr/ppp1pppp/8/8/2pP4/8/PP2PPPP/RNBQKBNR w KQkq -", "e2e3"}
 };
 
 // --- ZOBRIST HASHING ---
@@ -160,6 +168,9 @@ uint64_t get_hash(const Board& board) {
     return h;
 }
 
+// ============================================================
+// HÀM ĐÁNH GIÁ (SỬA LỖI XE, HẬU VÀ NHẬP THÀNH)
+// ============================================================
 int evaluate_white_score(Board& board) {
     int score = 0;
     int phase = 0;
@@ -197,8 +208,32 @@ int evaluate_white_score(Board& board) {
 
         bool is_attacked = board.isAttacked(s, enemy);
         bool is_defended = board.isAttacked(s, p.color());
+        
+        // Phạt quân bị treo (Hanging piece)
         if (is_attacked && !is_defended && p.type() != PieceType::KING) {
             val -= static_cast<int>(PIECE_VALUES[pt_idx] * 0.9);
+        }
+
+        // SỬA LỖI BỎ QUÊN HẬU: Bị tấn công bởi quân rẻ hơn -> Trừ điểm nặng
+        if (p.type() == PieceType::QUEEN && is_attacked) {
+            Bitboard attackers = board.attackers(enemy, s);
+            while (attackers) {
+                Square att_sq = attackers.pop();
+                Piece att_p = board.at(att_sq);
+                if (PIECE_VALUES[static_cast<int>(att_p.type())] < PIECE_VALUES[pt_idx]) {
+                    val -= 150; // Phạt nặng nếu Hậu bị Mã/Tốt/Tượng tấn công
+                    break;
+                }
+            }
+        }
+
+        // SỬA LỖI ĐI XE VÔ NGHĨA: Phạt Xe ra rìa hoặc đi lùi trong khai cuộc
+        if (p.type() == PieceType::ROOK && board.fullMoveNumber() <= 15) {
+            int file = sq % 8;
+            int rank = sq / 8;
+            int home_rank = (p.color() == Color::WHITE) ? 0 : 7;
+            if (file == 0 || file == 7) val -= 40; // Phạt ra rìa
+            if (rank == home_rank) val -= 20; // Phạt nằm ở hàng cuối
         }
 
         if (board.fullMoveNumber() <= 10 && p.type() == PieceType::QUEEN) val -= 20;
@@ -308,7 +343,7 @@ int evaluate_white_score(Board& board) {
         }
     }
 
-    // 6. An toàn Vua
+    // 6. An toàn Vua & NHẬP THÀNH SỚM
     for (Color color : {Color::WHITE, Color::BLACK}) {
         int sign = (color == Color::WHITE) ? 1 : -1;
         Square k_sq = board.kingSq(color);
@@ -320,8 +355,9 @@ int evaluate_white_score(Board& board) {
         bool castled = ((color == Color::WHITE && kr == 0 && (kf == 2 || kf == 6)) ||
                         (color == Color::BLACK && kr == 7 && (kf == 2 || kf == 6)));
 
+        // Thưởng lớn nếu đã nhập thành
         if (castled) {
-            score += sign * 70;
+            score += sign * 100; // Tăng từ 70 lên 100
             int direction = (color == Color::WHITE) ? 1 : -1;
             int shield = 0;
             for (int df = -1; df <= 1; df++) {
@@ -333,10 +369,13 @@ int evaluate_white_score(Board& board) {
             }
             if (shield == 0) score -= sign * 60;
             else if (shield == 1) score -= sign * 30;
-        }
-
-        if (!endgame && board.fullMoveNumber() <= 20 && kr != home_rank && !castled) {
-            score -= sign * 45; 
+        } else {
+            // PHẠT NẶNG NẾU KHÔNG NHẬP THÀNH SAU NƯỚC 10
+            if (board.fullMoveNumber() > 10) score -= sign * 60;
+            // Phạt Vua đi lang thang
+            if (!endgame && board.fullMoveNumber() <= 20 && kr != home_rank) {
+                score -= sign * 55; 
+            }
         }
     }
 
@@ -556,7 +595,7 @@ std::string extract_fen(const std::string& body) {
 
 int main() {
     init_zobrist();
-    std::cout << "Khởi động Nyra Engine (Giai đoạn 3: Book + Endgame)..." << std::endl;
+    std::cout << "Khởi động Nyra Engine (Bản Vị Trí + Mở Rộng Khai Cuộc)..." << std::endl;
 
     httplib::Server svr;
 
@@ -585,7 +624,6 @@ int main() {
                 res.status = 400; res.set_content("{\"error\":\"No FEN\"}", "application/json"); return;
             }
 
-            // Lấy FEN rút gọn để so sánh với Opening Book
             std::string fen_short = fen.substr(0, fen.find_last_of(" "));
             fen_short = fen_short.substr(0, fen_short.find_last_of(" ")); 
 
@@ -597,7 +635,6 @@ int main() {
                 res.set_content("{\"uci\":\"NONE\"}", "application/json"); return;
             }
 
-            // 1. Kiểm tra Opening Book trước
             if (opening_book.find(fen_short) != opening_book.end()) {
                 std::string book_move_uci = opening_book[fen_short];
                 for (int i = 0; i < moves.size(); i++) {
@@ -608,7 +645,6 @@ int main() {
                 }
             }
 
-            // 2. Nếu không có trong sách, chạy thuật toán Search
             transposition_table.clear();
             transposition_table.reserve(200000); 
             order_moves(board, moves);
