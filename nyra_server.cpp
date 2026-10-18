@@ -10,6 +10,7 @@
 #include <string>
 #include <unordered_map>
 #include <random>
+#include <memory>
 
 using namespace chess;
 
@@ -21,27 +22,23 @@ const char* input_names[] = {"input"};
 const char* output_names[] = {"policy", "value"};
 
 std::chrono::steady_clock::time_point start_time;
-const int TIME_LIMIT_MS = 3500; // Giới hạn 3.5s
-const int MAX_SIMULATIONS = 800;
+const int TIME_LIMIT_MS = 3500; 
+const int MAX_SIMULATIONS = 150; // Giảm mạnh để bảo vệ RAM của Render
 
-// --- MCTS NODE ---
+// --- MCTS NODE (Tối ưu bộ nhớ) ---
 class MCTSNode {
 public:
     Board board;
     MCTSNode* parent;
-    Move move; // Nước đi dẫn đến node này
+    Move move; 
     float prior;
     int visits;
     float value_sum;
-    std::vector<MCTSNode*> children;
+    std::vector<std::unique_ptr<MCTSNode>> children; // Dùng unique_ptr để tự động giải phóng
     bool is_expanded;
 
     MCTSNode(Board b, MCTSNode* p, Move m, float pr) 
         : board(b), parent(p), move(m), prior(pr), visits(0), value_sum(0), is_expanded(false) {}
-
-    ~MCTSNode() {
-        for (auto child : children) delete child;
-    }
 
     float get_value() const {
         return visits > 0 ? value_sum / visits : 0.0f;
@@ -57,11 +54,11 @@ public:
     MCTSNode* select_best_child() {
         float best_uct = -1e9;
         MCTSNode* best = nullptr;
-        for (auto child : children) {
+        for (auto& child : children) {
             float uct = child->get_uct();
             if (uct > best_uct) {
                 best_uct = uct;
-                best = child;
+                best = child.get();
             }
         }
         return best;
@@ -91,7 +88,6 @@ void evaluate_nn(const Board& board, std::vector<float>& policy, float& value) {
     float* logits = outputs[0].GetTensorMutableData<float>();
     float* val_out = outputs[1].GetTensorMutableData<float>();
     
-    // Softmax Policy
     policy.resize(4096);
     float max_logit = -1e9;
     for (int i = 0; i < 4096; i++) max_logit = std::max(max_logit, logits[i]);
@@ -107,14 +103,15 @@ void evaluate_nn(const Board& board, std::vector<float>& policy, float& value) {
 
 // --- MCTS SEARCH ---
 Move mcts_search(Board root_board) {
-    MCTSNode* root = new MCTSNode(root_board, nullptr, Move(), 1.0f);
+    // Sử dụng unique_ptr để đảm bảo toàn bộ cây tự động bị xóa khi thoát hàm
+    std::unique_ptr<MCTSNode> root = std::make_unique<MCTSNode>(root_board, nullptr, Move(), 1.0f);
     int sims = 0;
     
     while (sims < MAX_SIMULATIONS) {
         auto now = std::chrono::steady_clock::now();
         if (std::chrono::duration_cast<std::chrono::milliseconds>(now - start_time).count() >= TIME_LIMIT_MS) break;
         
-        MCTSNode* node = root;
+        MCTSNode* node = root.get();
         Board temp_board = node->board;
         
         // 1. Selection
@@ -134,7 +131,6 @@ Move mcts_search(Board root_board) {
         } else {
             evaluate_nn(temp_board, policy, value);
             
-            // Expand
             Movelist moves;
             movegen::legalmoves(moves, temp_board);
             for (int i = 0; i < moves.size(); i++) {
@@ -142,7 +138,7 @@ Move mcts_search(Board root_board) {
                 Board next_board = temp_board;
                 next_board.makeMove(m);
                 int idx = m.from().index() * 64 + m.to().index();
-                node->children.push_back(new MCTSNode(next_board, node, m, policy[idx]));
+                node->children.push_back(std::make_unique<MCTSNode>(next_board, node, m, policy[idx]));
             }
             node->is_expanded = true;
         }
@@ -150,27 +146,22 @@ Move mcts_search(Board root_board) {
         // 3. Backpropagation
         while (node != nullptr) {
             node->visits++;
-            // Value is from perspective of side to move at temp_board.
-            // We need value from perspective of node's parent's side to move.
-            // Alternating sign for each level up.
             node->value_sum += (node->board.sideToMove() == temp_board.sideToMove()) ? value : -value;
             node = node->parent;
         }
         sims++;
     }
     
-    // Chọn nước đi có số lần viếng thăm nhiều nhất
     float best_visits = -1;
     Move best_move = root->children.empty() ? Move() : root->children[0]->move;
-    for (auto child : root->children) {
+    for (auto& child : root->children) {
         if (child->visits > best_visits) {
             best_visits = child->visits;
             best_move = child->move;
         }
     }
     
-    delete root;
-    return best_move;
+    return best_move; // Không cần delete root vì unique_ptr đã tự làm
 }
 
 // --- API SERVER ---
@@ -185,7 +176,7 @@ std::string extract_fen(const std::string& body) {
 
 int main() {
     Ort::SessionOptions opts; opts.SetIntraOpNumThreads(1);
-    std::cout << "Đang load mô hình ONNX (MCTS)..." << std::endl;
+    std::cout << "Đang load mô hình ONNX (MCTS - Tối ưu RAM)..." << std::endl;
     session = new Ort::Session(env, "nyra_net.onnx", opts);
 
     httplib::Server svr;
@@ -214,7 +205,6 @@ int main() {
             start_time = std::chrono::steady_clock::now();
             Move best_move = mcts_search(board);
             
-            // Fallback nếu MCTS không tìm ra
             if (best_move == Move()) best_move = moves[0];
 
             int ms = (int)std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start_time).count();
