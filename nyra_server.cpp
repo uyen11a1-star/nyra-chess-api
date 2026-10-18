@@ -16,7 +16,7 @@ const int PIECE_VALUES[7] = {0, 100, 320, 330, 500, 900, 20000};
 const int MATE_SCORE = 100000;
 const int INF = 200000;
 
-// --- PST (Bảng điểm vị trí) ---
+// --- BẢNG ĐIỂM VỊ TRÍ (PST) ---
 const int PAWN_PST[64] = {
     0,  0,  0,  0,  0,  0,  0,  0,
     50, 50, 50, 50, 50, 50, 50, 50,
@@ -28,10 +28,10 @@ const int PAWN_PST[64] = {
      0,  0,  0,  0,  0,  0,  0,  0
 };
 const int KNIGHT_PST[64] = {
-    -100,-100,-100,-100,-100,-100,-100,-100,
+    -100,-100,-100,-100,-100,-100,-100,-100, // Phạt nặng Mã ra biên
     -100,-20,  0,  0,  0,  0,-20,-100,
     -100,  0, 10, 15, 15, 10,  0,-100,
-    -100,  5, 15, 30, 30, 15,  5,-100,
+    -100,  5, 15, 30, 30, 15,  5,-100, // Trung tâm được thưởng
     -100,  0, 15, 30, 30, 15,  0,-100,
     -100,  5, 10, 15, 15, 10,  5,-100,
     -100,-20,  0,  5,  5,  0,-20,-100,
@@ -78,19 +78,6 @@ const int KING_MID_PST[64] = {
      20, 30, 10,  0,  0, 10, 30, 20
 };
 
-// --- OPENING BOOK ---
-std::unordered_map<std::string, std::string> opening_book = {
-    {"rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq -", "e7e5"},
-    {"rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq -", "c7c5"},
-    {"rnbqkbnr/pppppppp/8/8/3P4/8/PPP1PPPP/RNBQKBNR b KQkq -", "d7d5"},
-    {"rnbqkbnr/pppppppp/8/8/3P4/8/PPP1PPPP/RNBQKBNR b KQkq -", "g8f6"},
-    {"r1bqkbnr/pppp1ppp/2n5/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R b KQkq -", "a7a6"},
-    {"r1bqk1nr/pppp1ppp/2n5/2b1p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq -", "c2c3"},
-    {"rnbqkbnr/pp2pppp/3p4/2p5/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq -", "d2d4"},
-    {"rnbqkbnr/ppp2ppp/4p3/3p4/2PP4/8/PP2PPPP/RNBQKBNR w KQkq -", "b1c3"},
-    {"rnbqkbnr/pppp1ppp/4p3/8/3PP3/8/PPP2PPP/RNBQKBNR b KQkq -", "d7d5"}
-};
-
 uint64_t zobrist_pieces[7][2][64];
 uint64_t zobrist_turn;
 enum TTFlag { EXACT, LOWERBOUND, UPPERBOUND };
@@ -99,7 +86,7 @@ std::unordered_map<uint64_t, TTEntry> transposition_table;
 
 std::chrono::steady_clock::time_point start_time;
 bool time_is_up = false;
-const int TIME_LIMIT_MS = 2500; 
+const int TIME_LIMIT_MS = 3000; // 3 giây
 const int MAX_DEPTH = 6; 
 
 void init_zobrist() {
@@ -164,9 +151,7 @@ int evaluate_white_score(Board& board) {
             val -= static_cast<int>(PIECE_VALUES[pt_idx] * 0.8);
         }
 
-        if (board.fullMoveNumber() <= 10) {
-            if (p.type() == PieceType::QUEEN) val -= 20; 
-        }
+        if (board.fullMoveNumber() <= 10 && p.type() == PieceType::QUEEN) val -= 20;
 
         score += sign * val;
     }
@@ -246,18 +231,6 @@ void order_moves(Board& board, Movelist& moves) {
         }
         
         if (move.promotionType() != PieceType::NONE) score += 9000;
-
-        // Cấm đẩy tốt biên
-        if (board.fullMoveNumber() <= 10) {
-            int from_file = move.from().index() % 8;
-            int to_file = move.to().index() % 8;
-            Piece p = board.at(move.from());
-            if (p != Piece::NONE && p.type() == PieceType::PAWN) {
-                if ((from_file == 0 || from_file == 7) && to_file == from_file) {
-                    score -= 99999; 
-                }
-            }
-        }
 
         sm.push_back({move, score});
     }
@@ -382,7 +355,7 @@ std::string extract_fen(const std::string& body) {
 
 int main() {
     init_zobrist();
-    std::cout << "Khởi động Nyra Engine (Thuần C++)..." << std::endl;
+    std::cout << "Khởi động Nyra Engine (Pure C++)..." << std::endl;
 
     httplib::Server svr;
 
@@ -411,24 +384,11 @@ int main() {
                 res.status = 400; res.set_content("{\"error\":\"No FEN\"}", "application/json"); return;
             }
 
-            std::string fen_short = fen.substr(0, fen.find_last_of(" "));
-            fen_short = fen_short.substr(0, fen_short.find_last_of(" ")); 
-            
             Board board = Board(fen);
             Movelist moves; movegen::legalmoves(moves, board);
             
             if (moves.size() == 0) {
                 res.set_content("{\"uci\":\"NONE\"}", "application/json"); return;
-            }
-
-            if (opening_book.find(fen_short) != opening_book.end()) {
-                std::string book_move_uci = opening_book[fen_short];
-                for (int i = 0; i < moves.size(); i++) {
-                    if (uci::moveToUci(moves[i]) == book_move_uci) {
-                        res.set_content("{\"uci\":\"" + book_move_uci + "\", \"search\":{\"depth\":0, \"method\":\"Opening Book\"}}", "application/json");
-                        return;
-                    }
-                }
             }
 
             transposition_table.clear();
