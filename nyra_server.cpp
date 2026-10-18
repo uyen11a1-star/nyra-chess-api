@@ -28,14 +28,14 @@ const int PAWN_PST[64] = {
      0,  0,  0,  0,  0,  0,  0,  0
 };
 const int KNIGHT_PST[64] = {
-    -50,-40,-30,-30,-30,-30,-40,-50,
-    -40,-20,  0,  0,  0,  0,-20,-40,
-    -30,  0, 10, 15, 15, 10,  0,-30,
-    -30,  5, 15, 20, 20, 15,  5,-30,
-    -30,  0, 15, 20, 20, 15,  0,-30,
-    -30,  5, 10, 15, 15, 10,  5,-30,
-    -40,-20,  0,  5,  5,  0,-20,-40,
-    -50,-40,-30,-30,-30,-30,-40,-50
+    -100,-100,-100,-100,-100,-100,-100,-100, // Phạt cực nặng Mã ra biên
+    -100,-20,  0,  0,  0,  0,-20,-100,
+    -100,  0, 10, 15, 15, 10,  0,-100,
+    -100,  5, 15, 30, 30, 15,  5,-100, // Trung tâm cộng 30
+    -100,  0, 15, 30, 30, 15,  0,-100,
+    -100,  5, 10, 15, 15, 10,  5,-100,
+    -100,-20,  0,  5,  5,  0,-20,-100,
+    -100,-100,-100,-100,-100,-100,-100,-100
 };
 const int BISHOP_PST[64] = {
     -20,-10,-10,-10,-10,-10,-10,-20,
@@ -106,7 +106,7 @@ std::unordered_map<uint64_t, TTEntry> transposition_table;
 
 std::chrono::steady_clock::time_point start_time;
 bool time_is_up = false;
-const int TIME_LIMIT_MS = 3500; 
+const int TIME_LIMIT_MS = 4000; // Tăng thời gian lên 4s
 const int MAX_DEPTH = 6; 
 
 void init_zobrist() {
@@ -171,17 +171,7 @@ int evaluate_white_score(Board& board) {
             val -= static_cast<int>(PIECE_VALUES[pt_idx] * 0.8);
         }
 
-        // PHẠT NẶNG TỐT BIÊN VÀ HẬU RA SỚM TRONG KHAI CUỘC
         if (board.fullMoveNumber() <= 10) {
-            if (p.type() == PieceType::PAWN) {
-                int f = sq % 8;
-                int r = sq / 8;
-                if (f == 0 || f == 7) {
-                    if ((p.color() == Color::WHITE && r > 1) || (p.color() == Color::BLACK && r < 6)) {
-                        val -= 50; // Phạt đẩy tốt biên
-                    }
-                }
-            }
             if (p.type() == PieceType::QUEEN) val -= 20; // Phạt Hậu ra sớm
         }
 
@@ -247,6 +237,7 @@ int evaluate_board(Board& board) {
     return current_score;
 }
 
+// --- CẤM ĐẨY TỐT BIÊN TRONG KHAI CUỘC ---
 void order_moves(Board& board, Movelist& moves) {
     struct SM { Move m; int s; };
     std::vector<SM> sm;
@@ -263,6 +254,18 @@ void order_moves(Board& board, Movelist& moves) {
         }
         
         if (move.promotionType() != PieceType::NONE) score += 9000;
+
+        // CẤM TUYỆT ĐỐI ĐẨY TỐT BIÊN TRONG 10 NƯỚC ĐẦU
+        if (board.fullMoveNumber() <= 10) {
+            int from_file = move.from().index() % 8;
+            int to_file = move.to().index() % 8;
+            Piece p = board.at(move.from());
+            if (p != Piece::NONE && p.type() == PieceType::PAWN) {
+                if ((from_file == 0 || from_file == 7) && to_file == from_file) {
+                    score -= 99999; // Cấm tuyệt đối
+                }
+            }
+        }
 
         sm.push_back({move, score});
     }
