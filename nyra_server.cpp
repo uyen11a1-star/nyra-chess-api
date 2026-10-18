@@ -1,6 +1,5 @@
 #include "chess.hpp"
 #include "httplib.h"
-#include <onnxruntime_cxx_api.h>
 #include <iostream>
 #include <vector>
 #include <array>
@@ -16,11 +15,6 @@ using namespace chess;
 const int PIECE_VALUES[7] = {0, 100, 320, 330, 500, 900, 20000}; 
 const int MATE_SCORE = 100000;
 const int INF = 200000;
-
-Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "NyraNet");
-Ort::Session* session;
-const char* input_names[] = {"input"};
-const char* output_names[] = {"policy", "value"};
 
 // --- OPENING BOOK ---
 std::unordered_map<std::string, std::string> opening_book = {
@@ -39,8 +33,8 @@ std::unordered_map<uint64_t, TTEntry> transposition_table;
 
 std::chrono::steady_clock::time_point start_time;
 bool time_is_up = false;
-const int TIME_LIMIT_MS = 4000; 
-const int MAX_DEPTH = 6;
+const int TIME_LIMIT_MS = 3500; // 3.5 giây an toàn tuyệt đối
+const int MAX_DEPTH = 7;        // Tăng lên 7 vì không dùng Neural nữa
 
 void init_zobrist() {
     std::mt19937_64 rng(12345);
@@ -64,22 +58,6 @@ uint64_t get_hash(const Board& board) {
     return h;
 }
 
-void encode_board(const Board& board, std::vector<float>& tensor) {
-    std::fill(tensor.begin(), tensor.end(), 0.0f);
-    for (int sq = 0; sq < 64; sq++) {
-        Piece piece = board.at(sq);
-        if (piece != Piece::NONE) {
-            int plane = -1; int pt = static_cast<int>(piece.type());
-            if (piece.color() == Color::WHITE) plane = pt - 1;       
-            else plane = (pt - 1) + 6;            
-            tensor[plane * 64 + (sq / 8) * 8 + (sq % 8)] = 1.0f;
-        }
-    }
-    if (board.sideToMove() == Color::WHITE) {
-        for (int i = 0; i < 64; i++) tensor[12 * 64 + i] = 1.0f;
-    }
-}
-
 int center_bonus(int sq) {
     int file_idx = sq % 8;
     int rank_idx = sq / 8;
@@ -87,6 +65,7 @@ int center_bonus(int sq) {
     return static_cast<int>(14 - 4 * distance);
 }
 
+// --- HÀM EVAL XỊN (Chỉ dùng Heuristic) ---
 int evaluate_white_score(Board& board) {
     int score = 0;
     int phase = 0;
@@ -116,6 +95,7 @@ int evaluate_white_score(Board& board) {
         Square s = static_cast<Square>(sq);
         Color enemy = (p.color() == Color::WHITE) ? Color::BLACK : Color::WHITE;
 
+        // Phạt quân bị treo
         bool is_attacked = board.isAttacked(s, enemy);
         bool is_defended = board.isAttacked(s, p.color());
         if (is_attacked && !is_defended && p.type() != PieceType::KING) {
@@ -145,14 +125,22 @@ int evaluate_white_score(Board& board) {
         } else if (p.type() == PieceType::BISHOP) {
             val += center_bonus(sq) / 2;
         } else if (p.type() == PieceType::ROOK) {
-            if (relative_rank == 6) val += 15;
+            // PHẠT NẶNG XE ĐI RA BIÊN HOẶC ĐI LÙI SỚM
+            if (board.fullMoveNumber() <= 15) {
+                if (file == 0 || file == 7) val -= 30;
+                if ((p.color() == Color::WHITE && rank == 0) || (p.color() == Color::BLACK && rank == 7)) {
+                    val -= 20; // Phạt Xe nằm ở hàng cuối
+                }
+            }
+            if (relative_rank == 6) val += 15; // Rook on 7th rank
         } else if (p.type() == PieceType::QUEEN) {
-            if (board.fullMoveNumber() <= 10) val -= 8;
+            if (board.fullMoveNumber() <= 10) val -= 15; // Phạt Hậu ra sớm
         }
 
         score += sign * val;
     }
 
+    // Cặp Tượng
     int w_bishops = 0, b_bishops = 0;
     for(int sq=0; sq<64; sq++) {
         Piece p = board.at(sq);
@@ -163,6 +151,7 @@ int evaluate_white_score(Board& board) {
     if (w_bishops >= 2) score += 35;
     if (b_bishops >= 2) score -= 35;
 
+    // An toàn Vua
     for (Color color : {Color::WHITE, Color::BLACK}) {
         int sign = (color == Color::WHITE) ? 1 : -1;
         Square k_sq = board.kingSq(color);
@@ -190,55 +179,26 @@ int evaluate_white_score(Board& board) {
         }
 
         if (!endgame && board.fullMoveNumber() <= 20 && kr != home_rank && !castled) {
-            score -= sign * 45;
-        }
-
-        if (!endgame) {
-            if ((kf == 3 || kf == 4) && board.fullMoveNumber() > 8) score -= sign * 20;
+            score -= sign * 45; // Phạt Vua đi lang thang
         }
     }
 
     return score;
 }
 
-// --- HÀM ĐÁNH GIÁ CÓ REPETITION PENALTY VÀ RANDOM NOISE ---
 int evaluate_board(Board& board) {
     if (board.isGameOver().second == GameResult::LOSE) return -MATE_SCORE;
     if (board.isGameOver().second == GameResult::DRAW) return 0;
-    
-    // NẾU THẾ CỜ BỊ LẶP LẠI 2 LẦN, COI NHƯ HÒA (0 ĐIỂM) ĐỂ TRÁNH VÒNG LẶP VÔ HẠN
-    if (board.isRepetition(2)) return 0;
+    if (board.isRepetition(2)) return 0; // Chống lặp
 
     int score = evaluate_white_score(board);
     
-    // Thêm Random Noise để phá vỡ thế trận hòa
+    // Thêm nhiễu để phá hòa
     static std::mt19937 gen(std::random_device{}());
-    std::uniform_int_distribution<> distr(-15, 15); // Nhiễu từ -15 đến 15
-    score += distr(gen); 
+    std::uniform_int_distribution<> distr(-10, 10);
+    score += distr(gen);
     
     return (board.sideToMove() == Color::WHITE) ? score : -score;
-}
-
-void order_moves_with_nn(Board& board, Movelist& moves) {
-    std::vector<float> inputs(18 * 8 * 8);
-    encode_board(board, inputs);
-    std::array<int64_t, 4> shape{1, 18, 8, 8};
-    auto mem = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
-    Ort::Value tensor = Ort::Value::CreateTensor<float>(mem, inputs.data(), inputs.size(), shape.data(), shape.size());
-    
-    auto outputs = session->Run(Ort::RunOptions{nullptr}, input_names, &tensor, 1, output_names, 2);
-    float* logits = outputs[0].GetTensorMutableData<float>(); 
-
-    struct SM { Move m; float s; };
-    std::vector<SM> sm;
-    sm.reserve(moves.size());
-    for (int i = 0; i < moves.size(); i++) {
-        int idx = moves[i].from().index() * 64 + moves[i].to().index();
-        float s = logits[idx] + (board.isCapture(moves[i]) ? 1000.0f : 0.0f); 
-        sm.push_back({moves[i], s});
-    }
-    std::sort(sm.begin(), sm.end(), [](const SM& a, const SM& b) { return a.s > b.s; });
-    for (int i = 0; i < moves.size(); i++) moves[i] = sm[i].m;
 }
 
 void order_moves_mvv_lva(Board& board, Movelist& moves) {
@@ -313,8 +273,7 @@ int negamax(Board& board, int depth, int alpha, int beta, bool root = false) {
     Movelist moves; movegen::legalmoves(moves, board);
     if (moves.size() == 0) return in_check ? -MATE_SCORE + depth : 0;
     
-    if (root) order_moves_with_nn(board, moves);
-    else order_moves_mvv_lva(board, moves);
+    order_moves_mvv_lva(board, moves);
     
     int best = -INF;
     Move best_move_in_node = moves[0];
@@ -371,9 +330,7 @@ std::string extract_fen(const std::string& body) {
 
 int main() {
     init_zobrist();
-    Ort::SessionOptions opts; opts.SetIntraOpNumThreads(1);
-    std::cout << "Đang load mô hình ONNX..." << std::endl;
-    session = new Ort::Session(env, "nyra_net.onnx", opts);
+    std::cout << "Khởi động Nyra Engine (Thuần Heuristic)..." << std::endl;
 
     httplib::Server svr;
 
@@ -414,7 +371,7 @@ int main() {
 
             transposition_table.clear();
             transposition_table.reserve(100000); 
-            order_moves_with_nn(board, moves);
+            order_moves_mvv_lva(board, moves); // Dùng MVV-LVA thay vì NN
             
             int best_score = -INF;
             Move best_move = moves[0];
@@ -486,6 +443,5 @@ int main() {
 
     std::cout << "Server C++ đang chạy ở cổng 8081..." << std::endl;
     svr.listen("0.0.0.0", 8081);
-    delete session;
     return 0;
 }
