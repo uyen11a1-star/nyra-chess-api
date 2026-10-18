@@ -78,19 +78,19 @@ const int KING_MID_PST[64] = {
      20, 30, 10,  0,  0, 10, 30, 20
 };
 
-// --- MỞ RỘNG OPENING BOOK (Gambits & Standard) ---
+// --- MỞ RỘNG OPENING BOOK ---
 std::unordered_map<std::string, std::string> opening_book = {
     // 1. e4 e5
     {"rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq -", "e7e5"},
-    // King's Gambit (1. e4 e5 2. f4)
+    // King's Gambit
     {"rnbqkbnr/pppp1ppp/8/4p3/4PP2/8/PPPP2PP/RNBQKBNR b KQkq f3", "e5f4"},
-    // Italian Game (1. e4 e5 2. Nf3 Nc6 3. Bc4)
+    // Italian Game
     {"r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R b KQkq -", "f8c5"},
-    // Ruy Lopez (1. e4 e5 2. Nf3 Nc6 3. Bb5)
+    // Ruy Lopez
     {"r1bqkbnr/pppp1ppp/2n5/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R b KQkq -", "a7a6"},
     // 1. e4 c5 (Sicilian)
     {"rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq -", "c7c5"},
-    // Sicilian Open (1. e4 c5 2. Nf3 d6 3. d4)
+    // Sicilian Open
     {"rnbqkbnr/pp2pppp/3p4/2p5/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq -", "d2d4"},
     // 1. e4 e6 (French)
     {"rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq -", "e7e6"},
@@ -98,9 +98,9 @@ std::unordered_map<std::string, std::string> opening_book = {
     {"rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq -", "c7c6"},
     // 1. d4 d5
     {"rnbqkbnr/pppppppp/8/8/3P4/8/PPP1PPPP/RNBQKBNR b KQkq -", "d7d5"},
-    // Queen's Gambit (1. d4 d5 2. c4)
+    // Queen's Gambit
     {"rnbqkbnr/ppp1pppp/8/3p4/2PP4/8/PP2PPPP/RNBQKBNR b KQkq c3", "e7e6"},
-    // Queen's Gambit Accepted (1. d4 d5 2. c4 dxc4)
+    // Queen's Gambit Accepted
     {"rnbqkbnr/ppp1pppp/8/8/2pP4/8/PP2PPPP/RNBQKBNR w KQkq -", "e2e3"}
 };
 
@@ -214,17 +214,9 @@ int evaluate_white_score(Board& board) {
             val -= static_cast<int>(PIECE_VALUES[pt_idx] * 0.9);
         }
 
-        // SỬA LỖI BỎ QUÊN HẬU: Bị tấn công bởi quân rẻ hơn -> Trừ điểm nặng
+        // SỬA LỖI BỎ QUÊN HẬU: Hậu bị tấn công (dù có bảo vệ) -> Phạt nặng
         if (p.type() == PieceType::QUEEN && is_attacked) {
-            Bitboard attackers = board.attackers(enemy, s);
-            while (attackers) {
-                Square att_sq = attackers.pop();
-                Piece att_p = board.at(att_sq);
-                if (PIECE_VALUES[static_cast<int>(att_p.type())] < PIECE_VALUES[pt_idx]) {
-                    val -= 150; // Phạt nặng nếu Hậu bị Mã/Tốt/Tượng tấn công
-                    break;
-                }
-            }
+            val -= 100; 
         }
 
         // SỬA LỖI ĐI XE VÔ NGHĨA: Phạt Xe ra rìa hoặc đi lùi trong khai cuộc
@@ -357,7 +349,7 @@ int evaluate_white_score(Board& board) {
 
         // Thưởng lớn nếu đã nhập thành
         if (castled) {
-            score += sign * 100; // Tăng từ 70 lên 100
+            score += sign * 100; 
             int direction = (color == Color::WHITE) ? 1 : -1;
             int shield = 0;
             for (int df = -1; df <= 1; df++) {
@@ -387,12 +379,12 @@ int evaluate_white_score(Board& board) {
                 int bf = bk.index() % 8;
                 int br = bk.index() / 8;
                 int edge_dist = std::min(std::min(bf, 7 - bf), std::min(br, 7 - br));
-                score += (7 - edge_dist) * 20; // Ép Vua đen ra biên
+                score += (7 - edge_dist) * 20; 
                 
                 Square wk = board.kingSq(Color::WHITE);
                 if (wk != Square::underlying::NO_SQ) {
                     int dist = std::abs((wk.index() % 8) - bf) + std::abs((wk.index() / 8) - br);
-                    score += (14 - dist) * 10; // Kéo Vua trắng lại gần
+                    score += (14 - dist) * 10; 
                 }
             }
         } else if (score < -300) {
@@ -401,7 +393,7 @@ int evaluate_white_score(Board& board) {
                 int wf = wk.index() % 8;
                 int wr = wk.index() / 8;
                 int edge_dist = std::min(std::min(wf, 7 - wf), std::min(wr, 7 - wr));
-                score -= (7 - edge_dist) * 20; // Ép Vua trắng ra biên
+                score -= (7 - edge_dist) * 20; 
                 
                 Square bk = board.kingSq(Color::BLACK);
                 if (bk != Square::underlying::NO_SQ) {
