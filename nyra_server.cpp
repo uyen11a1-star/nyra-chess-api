@@ -78,9 +78,11 @@ const int KING_MID_PST[64] = {
      20, 30, 10,  0,  0, 10, 30, 20
 };
 
-// --- ZOBRIST HASHING (Đã tối giản để tránh lỗi) ---
+// --- ZOBRIST HASHING ---
 uint64_t zobrist_pieces[7][2][64];
 uint64_t zobrist_turn;
+uint64_t zobrist_castling[16];
+uint64_t zobrist_ep[8];
 
 enum TTFlag { EXACT, LOWERBOUND, UPPERBOUND };
 struct TTEntry { int depth; int score; TTFlag flag; Move best_move; };
@@ -88,8 +90,12 @@ std::unordered_map<uint64_t, TTEntry> transposition_table;
 
 std::chrono::steady_clock::time_point start_time;
 bool time_is_up = false;
-const int TIME_LIMIT_MS = 3000; 
-const int MAX_DEPTH = 6; 
+long long total_nodes = 0;
+
+// TĂNG THỜI GIAN LÊN 15 GIÂY VÀ ĐỘ SÂU LÊN 10
+const int TIME_LIMIT_MS = 15000; 
+const int MAX_DEPTH = 10; 
+const int MAX_Q_DEPTH = 4; // Giới hạn độ sâu của Quiescence
 
 void init_zobrist() {
     std::mt19937_64 rng(12345);
@@ -98,6 +104,8 @@ void init_zobrist() {
             for (int sq = 0; sq < 64; sq++)
                 zobrist_pieces[pt][c][sq] = rng();
     zobrist_turn = rng();
+    for (int i = 0; i < 16; i++) zobrist_castling[i] = rng();
+    for (int i = 0; i < 8; i++) zobrist_ep[i] = rng();
 }
 
 uint64_t get_hash(const Board& board) {
@@ -111,7 +119,28 @@ uint64_t get_hash(const Board& board) {
     }
     if (board.sideToMove() == Color::WHITE) h ^= zobrist_turn;
     
-    // Đã bỏ phần hash Castling và En Passant để fix lỗi build
+    // Tránh lỗi compile bằng cách dùng FEN string cho Castling và EP
+    std::string fen = board.getFen();
+    size_t space1 = fen.find(' ');
+    if (space1 != std::string::npos) {
+        size_t space2 = fen.find(' ', space1 + 1);
+        if (space2 != std::string::npos) {
+            std::string castling = fen.substr(space1 + 1, space2 - space1 - 1);
+            if (castling.find('K') != std::string::npos) h ^= zobrist_castling[1];
+            if (castling.find('Q') != std::string::npos) h ^= zobrist_castling[2];
+            if (castling.find('k') != std::string::npos) h ^= zobrist_castling[4];
+            if (castling.find('q') != std::string::npos) h ^= zobrist_castling[8];
+            
+            size_t space3 = fen.find(' ', space2 + 1);
+            if (space3 != std::string::npos && space3 > space2 + 1) {
+                std::string ep = fen.substr(space2 + 1, space3 - space2 - 1);
+                if (ep != "-") {
+                    int ep_file = ep[0] - 'a';
+                    h ^= zobrist_ep[ep_file];
+                }
+            }
+        }
+    }
     return h;
 }
 
@@ -152,8 +181,9 @@ int evaluate_white_score(Board& board) {
         bool is_attacked = board.isAttacked(s, enemy);
         bool is_defended = board.isAttacked(s, p.color());
         
+        // Phạt quân bị treo (bị tấn công mà không được bảo vệ)
         if (is_attacked && !is_defended && p.type() != PieceType::KING) {
-            val -= static_cast<int>(PIECE_VALUES[pt_idx] * 0.8);
+            val -= static_cast<int>(PIECE_VALUES[pt_idx] * 0.9);
         }
 
         if (board.fullMoveNumber() <= 10 && p.type() == PieceType::QUEEN) val -= 20;
@@ -243,9 +273,19 @@ void order_moves(Board& board, Movelist& moves) {
     for (int i = 0; i < moves.size(); i++) moves[i] = sm[i].m;
 }
 
-int quiescence(Board& board, int alpha, int beta) {
+// --- SỬA LỖI 1 & 4: QUIESCENCE CÓ GIỚI HẠN ĐỘ SÂU VÀ CHECK TIME ---
+int quiescence(Board& board, int alpha, int beta, int depth) {
     if (time_is_up) return evaluate_board(board);
     
+    total_nodes++;
+    if ((total_nodes & 1023) == 0) { 
+        auto now = std::chrono::steady_clock::now(); 
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(now - start_time).count() >= TIME_LIMIT_MS) {
+            time_is_up = true;
+            return evaluate_board(board);
+        }
+    }
+
     bool in_check = board.inCheck();
     
     if (!in_check) {
@@ -253,6 +293,9 @@ int quiescence(Board& board, int alpha, int beta) {
         if (stand_pat >= beta) return beta;
         if (alpha < stand_pat) alpha = stand_pat;
     }
+
+    // Nếu đạt giới hạn độ sâu Quiescence, trả về đánh giá hiện tại
+    if (depth == 0) return evaluate_board(board);
 
     Movelist moves; movegen::legalmoves(moves, board);
     if (moves.size() == 0) return in_check ? -MATE_SCORE : 0;
@@ -268,7 +311,7 @@ int quiescence(Board& board, int alpha, int beta) {
 
     for (int i = 0; i < search_moves.size(); i++) {
         board.makeMove(search_moves[i]);
-        int score = -quiescence(board, -beta, -alpha);
+        int score = -quiescence(board, -beta, -alpha, depth - 1);
         board.unmakeMove(search_moves[i]);
         if (score >= beta) return beta;
         if (score > alpha) alpha = score;
@@ -279,9 +322,8 @@ int quiescence(Board& board, int alpha, int beta) {
 int negamax(Board& board, int depth, int alpha, int beta) {
     if (time_is_up) return evaluate_board(board);
 
-    static int nodes = 0;
-    nodes++;
-    if ((nodes & 1023) == 0) { 
+    total_nodes++;
+    if ((total_nodes & 1023) == 0) { 
         auto now = std::chrono::steady_clock::now(); 
         if (std::chrono::duration_cast<std::chrono::milliseconds>(now - start_time).count() >= TIME_LIMIT_MS) {
             time_is_up = true;
@@ -289,10 +331,10 @@ int negamax(Board& board, int depth, int alpha, int beta) {
         }
     }
 
-    if (depth == 0) return quiescence(board, alpha, beta);
+    if (depth == 0) return quiescence(board, alpha, beta, MAX_Q_DEPTH);
 
     bool in_check = board.inCheck();
-    if (transposition_table.size() > 100000) transposition_table.clear();
+    if (transposition_table.size() > 200000) transposition_table.clear();
 
     uint64_t hash = get_hash(board);
     if (transposition_table.find(hash) != transposition_table.end()) {
@@ -374,7 +416,7 @@ std::string extract_fen(const std::string& body) {
 
 int main() {
     init_zobrist();
-    std::cout << "Khởi động Nyra Engine..." << std::endl;
+    std::cout << "Khởi động Nyra Engine (Siêu Suy Luận 15s)..." << std::endl;
 
     httplib::Server svr;
 
@@ -404,7 +446,6 @@ int main() {
             }
 
             Board board = Board(fen);
-            
             Movelist moves; 
             movegen::legalmoves(moves, board);
             
@@ -413,7 +454,7 @@ int main() {
             }
 
             transposition_table.clear();
-            transposition_table.reserve(100000); 
+            transposition_table.reserve(200000); 
             order_moves(board, moves);
             
             int best_score = -INF;
@@ -421,6 +462,7 @@ int main() {
             int completed_depth = 0;
 
             time_is_up = false;
+            total_nodes = 0;
             start_time = std::chrono::steady_clock::now();
 
             for (int depth = 1; depth <= MAX_DEPTH; depth++) {
@@ -456,7 +498,7 @@ int main() {
             int ms = (int)std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start_time).count();
             
             std::string uci = uci::moveToUci(best_move);
-            std::string json_resp = "{\"uci\":\"" + uci + "\", \"search\":{\"depth\":" + std::to_string(completed_depth) + ", \"time_ms\":" + std::to_string(ms) + "}}";
+            std::string json_resp = "{\"uci\":\"" + uci + "\", \"search\":{\"depth\":" + std::to_string(completed_depth) + ", \"time_ms\":" + std::to_string(ms) + ", \"nodes\":" + std::to_string(total_nodes) + "}}";
             res.set_content(json_resp, "application/json");
             
         } catch (const std::exception& e) {
