@@ -9,6 +9,7 @@
 #include <string>
 #include <unordered_map>
 #include <random>
+#include <sstream>
 
 using namespace chess;
 
@@ -78,30 +79,28 @@ const int KING_MID_PST[64] = {
      20, 30, 10,  0,  0, 10, 30, 20
 };
 
-// --- MỞ RỘNG OPENING BOOK ---
+// --- OPENING BOOK (Sửa lỗi ghi đè FEN) ---
 std::unordered_map<std::string, std::string> opening_book = {
-    // 1. e4 e5
-    {"rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq -", "e7e5"},
-    // King's Gambit
-    {"rnbqkbnr/pppp1ppp/8/4p3/4PP2/8/PPPP2PP/RNBQKBNR b KQkq f3", "e5f4"},
-    // Italian Game
-    {"r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R b KQkq -", "f8c5"},
-    // Ruy Lopez
-    {"r1bqkbnr/pppp1ppp/2n5/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R b KQkq -", "a7a6"},
+    // 1. e4
+    {"rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq -", "e7e5"}, // Mở (Open Game)
     // 1. e4 c5 (Sicilian)
     {"rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq -", "c7c5"},
-    // Sicilian Open
-    {"rnbqkbnr/pp2pppp/3p4/2p5/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq -", "d2d4"},
     // 1. e4 e6 (French)
     {"rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq -", "e7e6"},
     // 1. e4 c6 (Caro-Kann)
     {"rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq -", "c7c6"},
-    // 1. d4 d5
+    // 1. d4
     {"rnbqkbnr/pppppppp/8/8/3P4/8/PPP1PPPP/RNBQKBNR b KQkq -", "d7d5"},
-    // Queen's Gambit
-    {"rnbqkbnr/ppp1pppp/8/3p4/2PP4/8/PP2PPPP/RNBQKBNR b KQkq c3", "e7e6"},
-    // Queen's Gambit Accepted
-    {"rnbqkbnr/ppp1pppp/8/8/2pP4/8/PP2PPPP/RNBQKBNR w KQkq -", "e2e3"}
+    // 1. d4 d5 2. c4 (Queen's Gambit)
+    {"rnbqkbnr/ppp1pppp/8/3p4/2PP4/8/PP2PPPP/RNBQKBNR b KQkq -", "e7e6"},
+    // 1. e4 e5 2. Nf3
+    {"rnbqkbnr/pppp1ppp/8/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R b KQkq -", "b8c6"},
+    // 1. e4 e5 2. Nf3 Nc6 3. Bc4 (Khai cuộc Italia)
+    {"r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R b KQkq -", "f8c5"},
+    // 1. e4 e5 2. Nf3 Nc6 3. Bb5 (Ruy Lopez)
+    {"r1bqkbnr/pppp1ppp/2n5/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R b KQkq -", "a7a6"},
+    // 1. e4 e5 2. f4 (King's Gambit)
+    {"rnbqkbnr/pppp1ppp/8/4p3/4PP2/8/PPPP2PP/RNBQKBNR b KQkq -", "e5f4"}
 };
 
 // --- ZOBRIST HASHING ---
@@ -169,7 +168,7 @@ uint64_t get_hash(const Board& board) {
 }
 
 // ============================================================
-// HÀM ĐÁNH GIÁ (SỬA LỖI XE, HẬU VÀ NHẬP THÀNH)
+// HÀM ĐÁNH GIÁ
 // ============================================================
 int evaluate_white_score(Board& board) {
     int score = 0;
@@ -186,7 +185,6 @@ int evaluate_white_score(Board& board) {
     }
     bool endgame = (phase <= 6);
 
-    // 1. Material, PST & Tấn công Vua
     for (int sq = 0; sq < 64; sq++) {
         Piece p = board.at(sq);
         if (p == Piece::NONE) continue;
@@ -209,23 +207,18 @@ int evaluate_white_score(Board& board) {
         bool is_attacked = board.isAttacked(s, enemy);
         bool is_defended = board.isAttacked(s, p.color());
         
-        // Phạt quân bị treo (Hanging piece)
         if (is_attacked && !is_defended && p.type() != PieceType::KING) {
             val -= static_cast<int>(PIECE_VALUES[pt_idx] * 0.9);
         }
 
-        // SỬA LỖI BỎ QUÊN HẬU: Hậu bị tấn công (dù có bảo vệ) -> Phạt nặng
-        if (p.type() == PieceType::QUEEN && is_attacked) {
-            val -= 100; 
-        }
+        if (p.type() == PieceType::QUEEN && is_attacked) val -= 100; 
 
-        // SỬA LỖI ĐI XE VÔ NGHĨA: Phạt Xe ra rìa hoặc đi lùi trong khai cuộc
         if (p.type() == PieceType::ROOK && board.fullMoveNumber() <= 15) {
             int file = sq % 8;
             int rank = sq / 8;
             int home_rank = (p.color() == Color::WHITE) ? 0 : 7;
-            if (file == 0 || file == 7) val -= 40; // Phạt ra rìa
-            if (rank == home_rank) val -= 20; // Phạt nằm ở hàng cuối
+            if (file == 0 || file == 7) val -= 40; 
+            if (rank == home_rank) val -= 20; 
         }
 
         if (board.fullMoveNumber() <= 10 && p.type() == PieceType::QUEEN) val -= 20;
@@ -240,7 +233,6 @@ int evaluate_white_score(Board& board) {
         score += sign * val;
     }
 
-    // 2. Cặp Tượng
     int w_bishops = 0, b_bishops = 0;
     for(int sq=0; sq<64; sq++) {
         Piece p = board.at(sq);
@@ -251,7 +243,6 @@ int evaluate_white_score(Board& board) {
     if (w_bishops >= 2) score += 35;
     if (b_bishops >= 2) score -= 35;
 
-    // 3. Cấu trúc Tốt & Tốt thông
     for (int file = 0; file < 8; file++) {
         int w_pawns = 0, b_pawns = 0;
         for (int rank = 0; rank < 8; rank++) {
@@ -294,7 +285,6 @@ int evaluate_white_score(Board& board) {
         }
     }
 
-    // 4. Xe trên cột mở
     for (int sq = 0; sq < 64; sq++) {
         Piece p = board.at(sq);
         if (p == Piece::NONE || p.type() != PieceType::ROOK) continue;
@@ -320,7 +310,6 @@ int evaluate_white_score(Board& board) {
         if (rel_rank == 6) score += sign * 30;
     }
 
-    // 5. Mã tiền đồn
     for (int sq = 0; sq < 64; sq++) {
         Piece p = board.at(sq);
         if (p == Piece::NONE || p.type() != PieceType::KNIGHT) continue;
@@ -335,7 +324,6 @@ int evaluate_white_score(Board& board) {
         }
     }
 
-    // 6. An toàn Vua & NHẬP THÀNH SỚM
     for (Color color : {Color::WHITE, Color::BLACK}) {
         int sign = (color == Color::WHITE) ? 1 : -1;
         Square k_sq = board.kingSq(color);
@@ -347,7 +335,6 @@ int evaluate_white_score(Board& board) {
         bool castled = ((color == Color::WHITE && kr == 0 && (kf == 2 || kf == 6)) ||
                         (color == Color::BLACK && kr == 7 && (kf == 2 || kf == 6)));
 
-        // Thưởng lớn nếu đã nhập thành
         if (castled) {
             score += sign * 100; 
             int direction = (color == Color::WHITE) ? 1 : -1;
@@ -362,16 +349,13 @@ int evaluate_white_score(Board& board) {
             if (shield == 0) score -= sign * 60;
             else if (shield == 1) score -= sign * 30;
         } else {
-            // PHẠT NẶNG NẾU KHÔNG NHẬP THÀNH SAU NƯỚC 10
             if (board.fullMoveNumber() > 10) score -= sign * 60;
-            // Phạt Vua đi lang thang
             if (!endgame && board.fullMoveNumber() <= 20 && kr != home_rank) {
                 score -= sign * 55; 
             }
         }
     }
 
-    // 7. ENDGAME MATE DRIVE (Dắt Vua tàn cuộc)
     if (endgame) {
         if (score > 300) {
             Square bk = board.kingSq(Color::BLACK);
@@ -585,9 +569,21 @@ std::string extract_fen(const std::string& body) {
     return body.substr(start, end - start);
 }
 
+// ============================================================
+// HÀM LẤY FEN RÚT GỌN CHUẨN XÁC 100%
+// ============================================================
+std::string get_short_fen(const std::string& full_fen) {
+    std::istringstream iss(full_fen);
+    std::string board, turn, castling, ep;
+    if (iss >> board >> turn >> castling >> ep) {
+        return board + " " + turn + " " + castling + " " + ep;
+    }
+    return full_fen;
+}
+
 int main() {
     init_zobrist();
-    std::cout << "Khởi động Nyra Engine (Bản Vị Trí + Mở Rộng Khai Cuộc)..." << std::endl;
+    std::cout << "Khởi động Nyra Engine..." << std::endl;
 
     httplib::Server svr;
 
@@ -616,8 +612,7 @@ int main() {
                 res.status = 400; res.set_content("{\"error\":\"No FEN\"}", "application/json"); return;
             }
 
-            std::string fen_short = fen.substr(0, fen.find_last_of(" "));
-            fen_short = fen_short.substr(0, fen_short.find_last_of(" ")); 
+            std::string fen_short = get_short_fen(fen); 
 
             Board board = Board(fen);
             Movelist moves; 
@@ -627,6 +622,7 @@ int main() {
                 res.set_content("{\"uci\":\"NONE\"}", "application/json"); return;
             }
 
+            // 1. Kiểm tra Opening Book
             if (opening_book.find(fen_short) != opening_book.end()) {
                 std::string book_move_uci = opening_book[fen_short];
                 for (int i = 0; i < moves.size(); i++) {
@@ -637,6 +633,7 @@ int main() {
                 }
             }
 
+            // 2. Search
             transposition_table.clear();
             transposition_table.reserve(200000); 
             order_moves(board, moves);
