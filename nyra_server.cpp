@@ -23,9 +23,8 @@ const char* output_names[] = {"policy", "value"};
 
 std::chrono::steady_clock::time_point start_time;
 const int TIME_LIMIT_MS = 3500; 
-const int MAX_SIMULATIONS = 150; // Giảm mạnh để bảo vệ RAM của Render
+const int MAX_SIMULATIONS = 150; // Vẫn giữ mức an toàn cho RAM
 
-// --- MCTS NODE (Tối ưu bộ nhớ) ---
 class MCTSNode {
 public:
     Board board;
@@ -34,7 +33,7 @@ public:
     float prior;
     int visits;
     float value_sum;
-    std::vector<std::unique_ptr<MCTSNode>> children; // Dùng unique_ptr để tự động giải phóng
+    std::vector<std::unique_ptr<MCTSNode>> children;
     bool is_expanded;
 
     MCTSNode(Board b, MCTSNode* p, Move m, float pr) 
@@ -65,7 +64,6 @@ public:
     }
 };
 
-// --- MẠNG NEURAL ---
 void evaluate_nn(const Board& board, std::vector<float>& policy, float& value) {
     std::vector<float> inputs(18 * 8 * 8, 0.0f);
     for (int sq = 0; sq < 64; sq++) {
@@ -101,9 +99,7 @@ void evaluate_nn(const Board& board, std::vector<float>& policy, float& value) {
     value = val_out[0];
 }
 
-// --- MCTS SEARCH ---
 Move mcts_search(Board root_board) {
-    // Sử dụng unique_ptr để đảm bảo toàn bộ cây tự động bị xóa khi thoát hàm
     std::unique_ptr<MCTSNode> root = std::make_unique<MCTSNode>(root_board, nullptr, Move(), 1.0f);
     int sims = 0;
     
@@ -114,13 +110,11 @@ Move mcts_search(Board root_board) {
         MCTSNode* node = root.get();
         Board temp_board = node->board;
         
-        // 1. Selection
         while (node->is_expanded && !node->children.empty()) {
             node = node->select_best_child();
             temp_board = node->board;
         }
         
-        // 2. Evaluation & Expansion
         std::vector<float> policy;
         float value;
         
@@ -143,7 +137,6 @@ Move mcts_search(Board root_board) {
             node->is_expanded = true;
         }
         
-        // 3. Backpropagation
         while (node != nullptr) {
             node->visits++;
             node->value_sum += (node->board.sideToMove() == temp_board.sideToMove()) ? value : -value;
@@ -161,10 +154,9 @@ Move mcts_search(Board root_board) {
         }
     }
     
-    return best_move; // Không cần delete root vì unique_ptr đã tự làm
+    return best_move; 
 }
 
-// --- API SERVER ---
 std::string extract_fen(const std::string& body) {
     size_t start = body.find("\"fen\"");
     if (start == std::string::npos) return "";
@@ -176,14 +168,25 @@ std::string extract_fen(const std::string& body) {
 
 int main() {
     Ort::SessionOptions opts; opts.SetIntraOpNumThreads(1);
-    std::cout << "Đang load mô hình ONNX (MCTS - Tối ưu RAM)..." << std::endl;
+    std::cout << "Đang load mô hình ONNX (MCTS)..." << std::endl;
     session = new Ort::Session(env, "nyra_net.onnx", opts);
 
     httplib::Server svr;
 
+    // THÊM ROUTE HEALTH VÀ ROOT
+    svr.Get("/", [](const httplib::Request&, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_content("{\"status\":\"ok\", \"engine\":\"C++ MCTS\"}", "application/json");
+    });
+
+    svr.Get("/health", [](const httplib::Request&, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_content("{\"status\":\"ready\", \"model_loaded\":true}", "application/json");
+    });
+
     svr.Options(R"(/.*)", [](const httplib::Request&, httplib::Response& res) {
         res.set_header("Access-Control-Allow-Origin", "*");
-        res.set_header("Access-Control-Allow-Methods", "POST, OPTIONS");
+        res.set_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
         res.set_header("Access-Control-Allow-Headers", "Content-Type");
         res.status = 200;
     });
