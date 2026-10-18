@@ -88,7 +88,7 @@ enum TTFlag { EXACT, LOWERBOUND, UPPERBOUND };
 struct TTEntry { int depth; int score; TTFlag flag; Move best_move; };
 std::unordered_map<uint64_t, TTEntry> transposition_table;
 
-// --- KILLER MOVES (Lưu 2 nước đi sát thủ cho mỗi tầng) ---
+// --- KILLER MOVES ---
 Move killer_moves[100][2];
 
 std::chrono::steady_clock::time_point start_time;
@@ -96,7 +96,7 @@ bool time_is_up = false;
 long long total_nodes = 0;
 
 const int TIME_LIMIT_MS = 15000; 
-const int MAX_DEPTH = 15; // Tăng trần độ sâu vì đã có cắt tỉa
+const int MAX_DEPTH = 15; 
 const int MAX_Q_DEPTH = 6; 
 
 void init_zobrist() {
@@ -266,20 +266,16 @@ void order_moves(Board& board, Movelist& moves, int ply) {
         Move move = moves[i];
         int score = 0;
         
-        // 1. Ưu tiên ăn quân (MVV-LVA)
         if (board.isCapture(move)) {
             Piece victim = board.at(move.to());
             if (victim != Piece::NONE) score += 10000 + 10 * PIECE_VALUES[static_cast<int>(victim.type())] - PIECE_VALUES[static_cast<int>(board.at(move.from()).type())];
             else score += 10000; 
         }
         
-        // 2. Ưu tiên phong cấp
         if (move.promotionType() != PieceType::NONE) score += 9000;
         
-        // 3. Ưu tiên nước chiếu tướng
         if (static_cast<int>(board.givesCheck(move)) != 0) score += 5000;
         
-        // 4. Ưu tiên Killer Moves
         if (ply < 100) {
             if (move == killer_moves[ply][0]) score += 4000;
             else if (move == killer_moves[ply][1]) score += 3000;
@@ -323,7 +319,6 @@ int quiescence(Board& board, int alpha, int beta, int depth) {
         }
     }
     
-    // Gọi order_moves với ply = 99 để không dùng killer moves trong quiescence
     order_moves(board, search_moves, 99);
 
     for (int i = 0; i < search_moves.size(); i++) {
@@ -364,15 +359,7 @@ int negamax(Board& board, int depth, int alpha, int beta, int ply) {
         }
     }
 
-    // --- NULL MOVE PRUNING ---
-    if (!in_check && depth >= 3 && beta - alpha == 1) {
-        // Tạo nước đi Null (nhường lượt)
-        board.makeMove(Move::make(Square::underlying::NO_SQ, Square::underlying::NO_SQ));
-        int score = -negamax(board, depth - 3, -beta, -beta + 1, ply + 1);
-        board.unmakeMove(Move::make(Square::underlying::NO_SQ, Square::underlying::NO_SQ));
-        
-        if (score >= beta) return beta; // Cắt tỉa nếu nhường lượt mà vẫn an toàn
-    }
+    // NMP ĐÃ BỊ GỠ BỎ HOÀN TOÀN Ở ĐÂY ĐỂ TRÁNH CRASH
 
     Movelist moves; movegen::legalmoves(moves, board);
     if (moves.size() == 0) return in_check ? -MATE_SCORE + depth : 0;
@@ -392,8 +379,7 @@ int negamax(Board& board, int depth, int alpha, int beta, int ply) {
         int extension = board.inCheck() ? 1 : 0;
         int new_depth = depth - 1 + extension;
 
-        // --- LATE MOVE REDUCTIONS (LMR) ---
-        // Giảm độ sâu ở các nước đi sau, không ăn quân, không chiếu tướng
+        // LMR
         if (i >= 3 && depth >= 3 && !in_check && !is_capture && !gives_check) {
             new_depth -= 1; 
         }
@@ -403,7 +389,6 @@ int negamax(Board& board, int depth, int alpha, int beta, int ply) {
             score = -negamax(board, new_depth, -beta, -alpha, ply + 1);
         } else {
             score = -negamax(board, new_depth, -alpha - 1, -alpha, ply + 1);
-            // Nếu nước bị giảm độ sâu mà bất ngờ tốt, tính lại ở độ sâu đầy đủ
             if (score > alpha && new_depth < depth - 1 + extension) {
                 score = -negamax(board, depth - 1 + extension, -beta, -alpha, ply + 1);
             } else if (score > alpha && score < beta) {
@@ -422,7 +407,6 @@ int negamax(Board& board, int depth, int alpha, int beta, int ply) {
         }
         if (alpha >= beta) {
             flag = LOWERBOUND;
-            // Lưu Killer Move
             if (!is_capture && ply < 100) {
                 if (killer_moves[ply][0] != moves[i]) {
                     killer_moves[ply][1] = killer_moves[ply][0];
@@ -453,7 +437,7 @@ std::string extract_fen(const std::string& body) {
 
 int main() {
     init_zobrist();
-    std::cout << "Khởi động Nyra Engine (Giai đoạn 1: Search Optimization)..." << std::endl;
+    std::cout << "Khởi động Nyra Engine (Giai đoạn 1: LMR + Killer Moves)..." << std::endl;
 
     httplib::Server svr;
 
@@ -493,7 +477,6 @@ int main() {
             transposition_table.clear();
             transposition_table.reserve(200000); 
             
-            // Reset Killer Moves
             for (int i = 0; i < 100; i++) {
                 killer_moves[i][0] = Move();
                 killer_moves[i][1] = Move();
