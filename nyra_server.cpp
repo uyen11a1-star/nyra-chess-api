@@ -170,7 +170,7 @@ uint64_t get_hash(const Board& board) {
 }
 
 // ============================================================
-// HÀM ĐÁNH GIÁ (BỎ PHẠT XE Ở HÀNG CUỐI)
+// HÀM ĐÁNH GIÁ
 // ============================================================
 int evaluate_white_score(Board& board) {
     int score = 0;
@@ -213,7 +213,6 @@ int evaluate_white_score(Board& board) {
             val -= static_cast<int>(PIECE_VALUES[pt_idx] * 0.9);
         }
 
-        // Chỉ phạt Xe ra rìa (a, h) trong khai cuộc, KHÔNG phạt Xe ở hàng cuối
         if (p.type() == PieceType::ROOK && board.fullMoveNumber() <= 15) {
             int file = sq % 8;
             if (file == 0 || file == 7) val -= 40; 
@@ -405,8 +404,36 @@ int evaluate_board(Board& board) {
 }
 
 // ============================================================
-// MOVE ORDERING (ĐẨY XE ĐI VÔ NGHĨA XUỐNG CUỐI)
+// HÀM LỌC NƯỚC ĐI (CHẶN XE ĐI VÔ NGHĨA)
 // ============================================================
+Movelist get_safe_moves(Board& board) {
+    Movelist all_moves;
+    movegen::legalmoves(all_moves, board);
+    Movelist safe_moves;
+
+    for (int i = 0; i < all_moves.size(); i++) {
+        Move move = all_moves[i];
+        bool is_bad = false;
+
+        // Nếu là 10 nước đầu tiên VÀ nước đi không phải ăn quân/chiếu tướng
+        if (board.fullMoveNumber() <= 10 && !board.isCapture(move) && static_cast<int>(board.givesCheck(move)) == 0) {
+            Piece p = board.at(move.from());
+            // Cấm Xe di chuyển lung tung
+            if (p != Piece::NONE && p.type() == PieceType::ROOK) {
+                is_bad = true;
+            }
+        }
+
+        if (!is_bad) {
+            safe_moves.add(move);
+        }
+    }
+
+    // Nếu bị kẹt không còn nước nào (hiếm), trả về tất cả
+    if (safe_moves.size() == 0) return all_moves;
+    return safe_moves;
+}
+
 void order_moves(Board& board, Movelist& moves) {
     struct SM { Move m; int s; };
     std::vector<SM> sm;
@@ -424,17 +451,6 @@ void order_moves(Board& board, Movelist& moves) {
         
         if (move.promotionType() != PieceType::NONE) score += 9000;
         if (static_cast<int>(board.givesCheck(move)) != 0) score += 5000;
-
-        // NẾU LÀ NƯỚC XE RA RÌA TRONG KHAI CUỘC -> ĐẨY XUỐNG CUỐI
-        if (board.fullMoveNumber() <= 10 && !board.isCapture(move)) {
-            Piece p = board.at(move.from());
-            if (p != Piece::NONE && p.type() == PieceType::ROOK) {
-                int to_file = move.to().index() % 8;
-                if (to_file == 0 || to_file == 7) {
-                    score -= 9999; // Ưu tiên thấp nhất, chỉ đi khi bí
-                }
-            }
-        }
 
         sm.push_back({move, score});
     }
@@ -514,7 +530,7 @@ int negamax(Board& board, int depth, int alpha, int beta) {
         }
     }
 
-    Movelist moves; movegen::legalmoves(moves, board);
+    Movelist moves = get_safe_moves(board); // Sử dụng bộ lọc chặn Xe đi vô nghĩa
     if (moves.size() == 0) return in_check ? -MATE_SCORE + depth : 0;
     
     order_moves(board, moves);
@@ -624,8 +640,7 @@ int main() {
             std::string fen_short = get_short_fen(fen); 
 
             Board board = Board(fen);
-            Movelist moves; 
-            movegen::legalmoves(moves, board);
+            Movelist moves = get_safe_moves(board); // Lọc ngay ở gốc
             
             if (moves.size() == 0) {
                 res.set_content("{\"uci\":\"NONE\"}", "application/json"); return;
@@ -698,7 +713,7 @@ int main() {
     int port = 8081;
     if (const char* env_p = std::getenv("PORT")) port = std::stoi(env_p);
     
-    std::cout << "Server đang chạy ở cổng " << port << "..." << std::endl;
+    std::cout << "Server đang chạy ở cổng " << port << std::endl;
     svr.listen("0.0.0.0", port);
     return 0;
 }
