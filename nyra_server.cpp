@@ -16,7 +16,7 @@ const int PIECE_VALUES[7] = {0, 100, 320, 330, 500, 900, 20000};
 const int MATE_SCORE = 100000;
 const int INF = 200000;
 
-// --- PIECE SQUARE TABLES (Dạy AI biết vị trí nào là tốt) ---
+// --- 2. PIECE SQUARE TABLES (PST) ---
 const int PAWN_PST[64] = {
     0,  0,  0,  0,  0,  0,  0,  0,
     50, 50, 50, 50, 50, 50, 50, 50,
@@ -120,7 +120,9 @@ uint64_t get_hash(const Board& board) {
     return h;
 }
 
-// --- HÀM ĐÁNH GIÁ (KẾT HỢP PST VÀ HEURISTIC) ---
+// ============================================================
+// HÀM ĐÁNH GIÁ TÍCH HỢP 7 TIÊU CHÍ
+// ============================================================
 int evaluate_white_score(Board& board) {
     int score = 0;
     int phase = 0;
@@ -136,6 +138,7 @@ int evaluate_white_score(Board& board) {
     }
     bool endgame = (phase <= 6);
 
+    // 1 & 2. Material và PST
     for (int sq = 0; sq < 64; sq++) {
         Piece p = board.at(sq);
         if (p == Piece::NONE) continue;
@@ -144,7 +147,6 @@ int evaluate_white_score(Board& board) {
         int pt_idx = static_cast<int>(p.type());
         int val = PIECE_VALUES[pt_idx];
         
-        // Lấy điểm từ PST (Bàn cờ lật ngược cho Đen)
         int pst_sq = (p.color() == Color::WHITE) ? sq : (sq ^ 56);
         if (p.type() == PieceType::PAWN) val += PAWN_PST[pst_sq];
         else if (p.type() == PieceType::KNIGHT) val += KNIGHT_PST[pst_sq];
@@ -153,23 +155,87 @@ int evaluate_white_score(Board& board) {
         else if (p.type() == PieceType::QUEEN) val += QUEEN_PST[pst_sq];
         else if (p.type() == PieceType::KING) val += KING_MID_PST[pst_sq];
 
+        // 5. Phạt quân bị treo
         Square s = static_cast<Square>(sq);
         Color enemy = (p.color() == Color::WHITE) ? Color::BLACK : Color::WHITE;
-
-        // Phạt quân bị treo
         bool is_attacked = board.isAttacked(s, enemy);
         bool is_defended = board.isAttacked(s, p.color());
         if (is_attacked && !is_defended && p.type() != PieceType::KING) {
             val -= static_cast<int>(PIECE_VALUES[pt_idx] * 0.8);
         }
 
-        // Phạt Hậu ra sớm
-        if (p.type() == PieceType::QUEEN && board.fullMoveNumber() <= 10) val -= 15;
-
         score += sign * val;
     }
 
-    // Cặp Tượng
+    // 3. Center Control (Kiểm soát trung tâm)
+    int center_squares[] = {27, 28, 35, 36}; // d4, e4, d5, e5
+    for (int sq : center_squares) {
+        Square s = static_cast<Square>(sq);
+        if (board.isAttacked(s, Color::WHITE)) score += 10;
+        if (board.isAttacked(s, Color::BLACK)) score -= 10;
+    }
+
+    // 4. Development (Phát triển quân)
+    if (board.fullMoveNumber() <= 12) {
+        for (int sq = 0; sq < 64; sq++) {
+            Piece p = board.at(sq);
+            if (p == Piece::NONE) continue;
+            
+            int rank = sq / 8;
+            if (p.type() == PieceType::KNIGHT || p.type() == PieceType::BISHOP) {
+                if (p.color() == Color::WHITE && rank == 0) score -= 15; // Chưa phát triển
+                if (p.color() == Color::BLACK && rank == 7) score += 15;
+            }
+            if (p.type() == PieceType::QUEEN) {
+                // Phạt Hậu ra sớm
+                if (p.color() == Color::WHITE && rank > 1 && board.fullMoveNumber() <= 8) score -= 20;
+                if (p.color() == Color::BLACK && rank < 6 && board.fullMoveNumber() <= 8) score += 20;
+            }
+        }
+    }
+
+    // 6. Cấu trúc Tốt (Pawn Structure)
+    for (int file = 0; file < 8; file++) {
+        int w_pawns_on_file = 0, b_pawns_on_file = 0;
+        for (int rank = 0; rank < 8; rank++) {
+            Piece p = board.at(chess::Square(chess::File(file), chess::Rank(rank)));
+            if (p != Piece::NONE && p.type() == PieceType::PAWN) {
+                if (p.color() == Color::WHITE) w_pawns_on_file++;
+                else b_pawns_on_file++;
+            }
+        }
+        if (w_pawns_on_file > 1) score -= 20 * (w_pawns_on_file - 1); // Phạt Tốt chồng
+        if (b_pawns_on_file > 1) score += 20 * (b_pawns_on_file - 1);
+        
+        if (w_pawns_on_file == 1) {
+            bool isolated = true;
+            for (int df = -1; df <= 1; df += 2) {
+                int nf = file + df;
+                if (nf >= 0 && nf < 8) {
+                    for (int rank = 0; rank < 8; rank++) {
+                        Piece p = board.at(chess::Square(chess::File(nf), chess::Rank(rank)));
+                        if (p != Piece::NONE && p.type() == PieceType::PAWN && p.color() == Color::WHITE) isolated = false;
+                    }
+                }
+            }
+            if (isolated) score -= 15; // Phạt Tốt cô lập
+        }
+        if (b_pawns_on_file == 1) {
+            bool isolated = true;
+            for (int df = -1; df <= 1; df += 2) {
+                int nf = file + df;
+                if (nf >= 0 && nf < 8) {
+                    for (int rank = 0; rank < 8; rank++) {
+                        Piece p = board.at(chess::Square(chess::File(nf), chess::Rank(rank)));
+                        if (p != Piece::NONE && p.type() == PieceType::PAWN && p.color() == Color::BLACK) isolated = false;
+                    }
+                }
+            }
+            if (isolated) score += 15;
+        }
+    }
+
+    // 5. An toàn Vua (King Safety) & Cặp Tượng
     int w_bishops = 0, b_bishops = 0;
     for(int sq=0; sq<64; sq++) {
         Piece p = board.at(sq);
@@ -180,7 +246,6 @@ int evaluate_white_score(Board& board) {
     if (w_bishops >= 2) score += 35;
     if (b_bishops >= 2) score -= 35;
 
-    // An toàn Vua
     for (Color color : {Color::WHITE, Color::BLACK}) {
         int sign = (color == Color::WHITE) ? 1 : -1;
         Square k_sq = board.kingSq(color);
@@ -203,19 +268,18 @@ int evaluate_white_score(Board& board) {
                     if (p != Piece::NONE && p.color() == color && p.type() == PieceType::PAWN) shield++;
                 }
             }
-            if (shield == 0) score -= sign * 60;
+            if (shield == 0) score -= sign * 60; // Mất sạch tốt che chắn
             else if (shield == 1) score -= sign * 30;
         }
 
         if (!endgame && board.fullMoveNumber() <= 20 && kr != home_rank && !castled) {
-            score -= sign * 45; 
+            score -= sign * 45; // Phạt Vua đi lang thang
         }
     }
 
     return score;
 }
 
-// --- LOGIC CHỐNG LẶP THÔNG MINH ---
 int evaluate_board(Board& board) {
     if (board.isGameOver().second == GameResult::LOSE) return -MATE_SCORE;
     if (board.isGameOver().second == GameResult::DRAW) return 0;
@@ -223,20 +287,13 @@ int evaluate_board(Board& board) {
     int score = evaluate_white_score(board);
     int current_score = (board.sideToMove() == Color::WHITE) ? score : -score;
 
-    // Nếu thế cờ lặp lại 2 lần
+    // Chống lặp (Repetition)
     if (board.isRepetition(2)) {
-        // Nếu đang có lợi thế lớn mà lại chọn đi lặp để hòa -> Phạt nặng
         if (current_score > 100) return -500; 
-        // Nếu đang bất lợi mà đi lặp để hòa -> Thưởng nhẹ
         if (current_score < -100) return 50;
         return 0;
     }
 
-    // Nhiễu nhỏ để phá cân bằng
-    static std::mt19937 gen(std::random_device{}());
-    std::uniform_int_distribution<> distr(-5, 5);
-    current_score += distr(gen);
-    
     return current_score;
 }
 
@@ -249,17 +306,14 @@ void order_moves(Board& board, Movelist& moves) {
         Move move = moves[i];
         int score = 0;
         
-        // 1. Ưu tiên ăn quân (MVV-LVA)
         if (board.isCapture(move)) {
             Piece victim = board.at(move.to());
             if (victim != Piece::NONE) score += 10000 + 10 * PIECE_VALUES[static_cast<int>(victim.type())] - PIECE_VALUES[static_cast<int>(board.at(move.from()).type())];
-            else score += 10000; // En passant
+            else score += 10000; 
         }
         
-        // 2. Ưu tiên phong cấp
-        if (move.typeOf() == Move::Type::PROMOTION) score += 9000;
+        if (move.promotionType() != PieceType::NONE) score += 9000;
         
-        // 3. Ưu tiên phát triển quân (Từ hàng cuối đi lên)
         int from_rank = move.from().index() / 8;
         if (board.sideToMove() == Color::WHITE && from_rank == 0) score += 500;
         if (board.sideToMove() == Color::BLACK && from_rank == 7) score += 500;
@@ -382,7 +436,7 @@ std::string extract_fen(const std::string& body) {
 
 int main() {
     init_zobrist();
-    std::cout << "Khởi động Nyra Engine (PST + Heuristic)..." << std::endl;
+    std::cout << "Khởi động Nyra Engine (Full 7 Heuristics)..." << std::endl;
 
     httplib::Server svr;
 
