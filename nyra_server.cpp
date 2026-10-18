@@ -78,266 +78,48 @@ const int KING_MID_PST[64] = {
      20, 30, 10,  0,  0, 10, 30, 20
 };
 
-// --- OPENING BOOK (30 khai cuộc phổ biến) ---
-// Mỗi FEN (rút gọn 4 trường: pieces side castling ep) có thể có nhiều nước đi,
-// engine sẽ chọn ngẫu nhiên 1 nước để đa dạng hóa khai cuộc.
+// --- OPENING BOOK (GỌN: King's Pawn, Queen's Gambit, Italian, Caro-Kann, Sicilian) ---
+// Mỗi FEN rút gọn có thể có nhiều nước chính thống, chọn ngẫu nhiên 1.
 std::unordered_map<std::string, std::vector<std::string>> opening_book = {
-    // ============================================================
-    // ĐÁP TRẢ NƯỚC ĐI ĐẦU TIÊN CỦA TRẮNG
-    // ============================================================
-
-    // 1.e4 → Open Game (e5), Sicilian (c5), French (e6), Caro-Kann (c6),
-    //         Scandinavian (d5), Alekhine (Nf6)
+    // 1.e4 → King's Pawn (e5) / Sicilian (c5) / Caro-Kann (c6)
     {"rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq -",
-        {"e7e5", "c7c5", "e7e6", "c7c6", "d7d5", "g8f6"}},
+        {"e7e5", "c7c5", "c7c6"}},
 
-    // 1.d4 → Closed Game (d5), Indian (Nf6)
+    // 1.d4 → Queen's Pawn (d5)
     {"rnbqkbnr/pppppppp/8/8/3P4/8/PPP1PPPP/RNBQKBNR b KQkq -",
-        {"d7d5", "g8f6"}},
-
-    // 1.c4 (English) → e5, Nf6
-    {"rnbqkbnr/pppppppp/8/8/2P5/8/PP1PPPPP/RNBQKBNR b KQkq -",
-        {"e7e5", "g8f6"}},
-
-    // 1.Nf3 (Réti) → d5, Nf6
-    {"rnbqkbnr/pppppppp/8/8/8/5N2/PPPPPPPP/RNBQKB1R b KQkq -",
-        {"d7d5", "g8f6"}},
-
-    // 1.f4 (Bird) → d5
-    {"rnbqkbnr/pppppppp/8/8/5P2/8/PPPPP1PP/RNBQKBNR b KQkq -",
         {"d7d5"}},
 
-    // ============================================================
-    // 1.e4 e5 — OPEN GAME
-    // ============================================================
-
-    // White's 2nd move
+    // 1.e4 e5 (lượt trắng) → 2.Nf3
     {"rnbqkbnr/pppp1ppp/8/4p3/4P3/8/PPPP1PPP/RNBQKBNR w KQkq -",
-        {"g1f3", "f1c4", "b1c3", "f2f4"}},
+        {"g1f3"}},
 
-    // Black's 2nd reply after 2.Nf3
-    {"rnbqkbnr/pppp1ppp/8/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R b KQkq -",
-        {"b8c6", "d7d6"}},
-
-    // White's 3rd after 2...Nc6
+    // 1.e4 e5 2.Nf3 Nc6 (lượt trắng) → 3.Bc4 (Italian Game)
     {"r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq -",
-        {"f1b5", "f1c4", "d2d4"}},
+        {"f1c4"}},
 
-    // Italian & Two Knights: Black's 3rd reply to Bc4
-    {"r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R b KQkq -",
-        {"f8c5", "g8f6"}},
-
-    // Giuoco Piano: White's 4th after 3...Bc5
-    {"r1bqk1nr/pppp1ppp/2n5/2b1p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq -",
-        {"c2c3", "d2d3", "b2b4"}},
-
-    // Two Knights: White's 4th after 3...Nf6
-    {"r1bqkb1r/pppp1ppp/2n2n2/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq -",
-        {"f3g5", "d2d3"}},
-
-    // Ruy Lopez: Black's 3rd reply to Bb5
-    {"r1bqkbnr/pppp1ppp/2n5/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R b KQkq -",
-        {"a7a6", "g8f6"}},
-
-    // Morphy Defense: White's 4th after 3...a6
-    {"r1bqkbnr/1ppp1ppp/p1n5/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R w KQkq -",
-        {"b5a4"}},
-
-    // Berlin Defense: White's 4th after 3...Nf6
-    {"r1bqkb1r/pppp1ppp/2n2n2/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R w KQkq -",
-        {"e1g1"}},
-
-    // Vienna: White's 3rd after 2.Nc3 Nf6
-    {"rnbqkb1r/pppp1ppp/5n2/4p3/4P3/2N5/PPPP1PPP/R1BQKBNR w KQkq -",
-        {"f1c4", "f2f4", "g1f3"}},
-
-    // King's Gambit: White's 3rd after 2.f4 exf4
-    {"rnbqkbnr/pppp1ppp/8/8/4Pp2/8/PPPP2PP/RNBQKBNR w KQkq -",
-        {"g1f3", "f1c4"}},
-
-    // ============================================================
-    // SICILIAN DEFENSE (1.e4 c5)
-    // ============================================================
-
-    // White's 2nd
+    // 1.e4 c5 (lượt trắng) → 2.Nf3 (Sicilian)
     {"rnbqkbnr/pp1ppppp/8/2p5/4P3/8/PPPP1PPP/RNBQKBNR w KQkq -",
-        {"g1f3", "b1c3", "c2c3"}},
+        {"g1f3"}},
 
-    // Black's 2nd reply after 2.Nf3
-    {"rnbqkbnr/pp1ppppp/8/2p5/4P3/5N2/PPPP1PPP/RNBQKB1R b KQkq -",
-        {"d7d6", "b8c6", "e7e6"}},
-
-    // After 2...d6, White's 3rd
+    // 1.e4 c5 2.Nf3 d6 (lượt trắng) → 3.d4 (Sicilian main line)
     {"rnbqkbnr/pp2pppp/3p4/2p5/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq -",
         {"d2d4"}},
 
-    // After 3.d4 cxd4 4.Nxd4, Black's 4th
-    {"rnbqkbnr/pp2pppp/3p4/8/3NP3/8/PPP2PPP/RNBQKB1R b KQkq -",
-        {"g8f6"}},
-
-    // After 4...Nf6, White's 5th
-    {"rnbqkb1r/pp2pppp/3p1n2/8/3NP3/8/PPP2PPP/RNBQKB1R w KQkq -",
-        {"b1c3"}},
-
-    // After 5.Nc3, Black's 5th (Najdorf a6 / Dragon g6)
-    {"rnbqkb1r/pp2pppp/3p1n2/8/3NP3/2N5/PPP2PPP/R1BQKB1R b KQkq -",
-        {"a7a6", "g7g6"}},
-
-    // Najdorf: White's 6th after 5...a6
-    {"rnbqkb1r/1p2pppp/p2p1n2/8/3NP3/2N5/PPP2PPP/R1BQKB1R w KQkq -",
-        {"c1e3", "f1e2"}},
-
-    // Dragon: White's 6th after 5...g6
-    {"rnbqkb1r/pp2pp1p/3p1np1/8/3NP3/2N5/PPP2PPP/R1BQKB1R w KQkq -",
-        {"c1e3", "f1e2"}},
-
-    // ============================================================
-    // FRENCH DEFENSE (1.e4 e6)
-    // ============================================================
-
-    // White's 2nd
-    {"rnbqkbnr/pppp1ppp/4p3/8/4P3/8/PPPP1PPP/RNBQKBNR w KQkq -",
+    // 1.e4 c6 (lượt trắng) → 2.d4 (Caro-Kann)
+    {"rnbqkbnr/pp1ppppp/2p5/8/4P3/8/PPPP1PPP/RNBQKBNR w KQkq -",
         {"d2d4"}},
 
-    // White's 3rd after 2.d4 d5
-    {"rnbqkbnr/ppp2ppp/4p3/3p4/3PP3/8/PPP2PPP/RNBQKBNR w KQkq -",
-        {"b1c3", "e4e5", "b1d2"}},
-
-    // Classical: White's 4th after 3.Nc3 Nf6
-    {"rnbqkb1r/ppp2ppp/4pn2/3p4/3PP3/2N5/PPP2PPP/R1BQKBNR w KQkq -",
-        {"e4e5", "c1g5"}},
-
-    // Winawer: White's 4th after 3.Nc3 Bb4
-    {"rnbqk2r/ppp2ppp/4p3/3p4/1bPP4/2N5/PP2PPPP/R1BQKBNR w KQkq -",
-        {"e4e5", "c1d2"}},
-
-    // ============================================================
-    // CARO-KANN (1.e4 c6)
-    // ============================================================
-
-    // White's 2nd
-    {"rnbqkbnr/pp1ppppp/2p5/8/4P3/8/PPPP1PPP/RNBQKBNR w KQkq -",
-        {"d2d4", "b1c3"}},
-
-    // White's 3rd after 2.d4 d5
+    // 1.e4 c6 2.d4 d5 (lượt trắng) → 3.Nc3 (Caro-Kann Classical)
     {"rnbqkbnr/pp2pppp/2p5/3p4/3PP3/8/PPP2PPP/RNBQKBNR w KQkq -",
-        {"b1c3", "e4e5"}},
-
-    // Classical: White's 4th after 3.Nc3 dxe4
-    {"rnbqkbnr/pp2pppp/2p5/8/3Pp3/2N5/PPP2PPP/R1BQKBNR w KQkq -",
-        {"c3e4"}},
-
-    // Advance: Black's 3rd after 3.e5
-    {"rnbqkbnr/pp2pppp/2p5/3pP3/3P4/8/PPP2PPP/RNBQKBNR b KQkq -",
-        {"c8f5"}},
-
-    // ============================================================
-    // SCANDINAVIAN (1.e4 d5)
-    // ============================================================
-
-    {"rnbqkbnr/ppp1pppp/8/3p4/4P3/8/PPPP1PPP/RNBQKBNR w KQkq -",
-        {"e4d5"}},
-
-    {"rnb1kbnr/ppp1pppp/8/3q4/8/8/PPPP1PPP/RNBQKBNR w KQkq -",
-        {"b1c3", "d2d4"}},
-
-    // ============================================================
-    // ALEKHINE (1.e4 Nf6)
-    // ============================================================
-
-    {"rnbqkb1r/pppppppp/5n2/8/4P3/8/PPPP1PPP/RNBQKBNR w KQkq -",
-        {"e4e5"}},
-
-    {"rnbqkb1r/pppppppp/8/3nP3/8/8/PPPP1PPP/RNBQKBNR w KQkq -",
-        {"d2d4", "b1c3"}},
-
-    // ============================================================
-    // PIRC (1.e4 d6 ...) & MODERN (1.e4 g6 ...)
-    // ============================================================
-
-    // Pirc after 3.Nc3 g6, White's 4th
-    {"rnbqkb1r/ppp1pp1p/3p1np1/8/3PP3/2N5/PPP2PPP/R1BQKBNR w KQkq -",
-        {"c1e3", "f1e2", "f2f4"}},
-
-    // Modern after 2.d4 Bg7, White's 3rd
-    {"rnbqk1nr/ppppppbp/6p1/8/3PP3/8/PPP2PPP/RNBQKBNR w KQkq -",
         {"b1c3"}},
 
-    // ============================================================
-    // 1.d4 d5 — CLOSED GAME
-    // ============================================================
-
-    // White's 2nd
+    // 1.d4 d5 (lượt trắng) → 2.c4 (Queen's Gambit)
     {"rnbqkbnr/ppp1pppp/8/3p4/3P4/8/PPP1PPPP/RNBQKBNR w KQkq -",
-        {"c2c4", "g1f3", "c1f4"}},
+        {"c2c4"}},
 
-    // After 2.c4, Black's 2nd (QGD e6, Slav c6, QGA dxc4)
+    // 1.d4 d5 2.c4 (lượt đen) → 2...e6 (QGD) hoặc 2...c6 (Slav)
     {"rnbqkbnr/ppp1pppp/8/3p4/2PP4/8/PP2PPPP/RNBQKBNR b KQkq -",
-        {"e7e6", "c7c6", "d5c4"}},
-
-    // QGD: after 2...e6, White's 3rd
-    {"rnbqkbnr/ppp2ppp/4p3/3p4/2PP4/8/PP2PPPP/RNBQKBNR w KQkq -",
-        {"b1c3", "g1f3"}},
-
-    // QGD: after 3.Nc3, Black's 3rd
-    {"rnbqkbnr/ppp2ppp/4p3/3p4/2PP4/2N5/PP2PPPP/R1BQKBNR b KQkq -",
-        {"g8f6", "c7c5"}},
-
-    // QGA: after 2...dxc4, White's 3rd
-    {"rnbqkbnr/ppp1pppp/8/8/2pP4/8/PP2PPPP/RNBQKBNR w KQkq -",
-        {"g1f3", "e2e3"}},
-
-    // Slav: after 2...c6, White's 3rd
-    {"rnbqkbnr/pp2pppp/2p5/3p4/2PP4/8/PP2PPPP/RNBQKBNR w KQkq -",
-        {"b1c3", "g1f3"}},
-
-    // Slav: after 3.Nc3, Black's 3rd (dxc4 = main Slav, Nf6/e6 = Semi-Slav)
-    {"rnbqkbnr/pp2pppp/2p5/3p4/2PP4/2N5/PP2PPPP/R1BQKBNR b KQkq -",
-        {"d5c4", "g8f6", "e7e6"}},
-
-    // London System: after 1.d4 d5 2.Nf3 Nf6 3.Bf4 e6, White's 4th
-    {"rnbqkb1r/ppp2ppp/4pn2/3p4/3P1B2/5N2/PPP1PPPP/RN1QKB1R w KQkq -",
-        {"e2e3", "c2c4"}},
-
-    // ============================================================
-    // 1.d4 Nf6 — INDIAN DEFENSES
-    // ============================================================
-
-    // White's 2nd
-    {"rnbqkb1r/pppppppp/5n2/8/3P4/8/PPP1PPPP/RNBQKBNR w KQkq -",
-        {"c2c4", "g1f3", "c1g5"}},
-
-    // KID: after 5...O-O, White's 6th
-    {"rnbq1rk1/ppp1ppbp/3p1np1/8/2PPP3/2N2N2/PP3PPP/R1BQKB1R w KQ -",
-        {"f1e2", "c1e3"}},
-
-    // Nimzo-Indian: after 3...Bb4, White's 4th
-    {"rnbqk2r/pppp1ppp/4pn2/8/1bPP4/2N5/PP2PPPP/R1BQKBNR w KQkq -",
-        {"e2e3", "d1c2"}},
-
-    // Catalan: after 3...d5, White's 4th
-    {"rnbqkb1r/ppp2ppp/4pn2/3p4/2PP4/6P1/PP2PP1P/RNBQKBNR w KQkq -",
-        {"f1g2"}},
-
-    // Benoni: after 3...e6, White's 4th
-    {"rnbqkb1r/pp1p1ppp/4pn2/2pP4/2P5/8/PP2PPPP/RNBQKBNR w KQkq -",
-        {"b1c3", "g1f3"}},
-
-    // Dutch: after 2.g3 Nf6, White's 3rd
-    {"rnbqkb1r/ppppp1pp/5n2/5p2/3P4/6P1/PPP1PP1P/RNBQKBNR w KQkq -",
-        {"f1g2", "g1f3"}},
-
-    // ============================================================
-    // ENGLISH (1.c4) & RÉTI (1.Nf3)
-    // ============================================================
-
-    // English: after 2.Nc3 Nf6, White's 3rd
-    {"rnbqkb1r/pppp1ppp/5n2/4p3/2P5/2N5/PP1PPPPP/R1BQKBNR w KQkq -",
-        {"g1f3", "g2g3"}},
-
-    // Réti: after 1...d5, White's 2nd
-    {"rnbqkbnr/ppp1pppp/8/3p4/8/5N2/PPPPPPPP/RNBQKB1R w KQkq -",
-        {"c2c4", "g2g3", "b2b3"}}
+        {"e7e6", "c7c6"}},
 };
 
 // --- ZOBRIST HASHING ---
@@ -584,7 +366,7 @@ int evaluate_white_score(Board& board) {
         }
     }
 
-    // 7. ENDGAME MATE DRIVE (Dắt Vua tàn cuộc)
+    // 7. ENDGAME MATE DRIVE
     if (endgame) {
         if (score > 300) {
             Square bk = board.kingSq(Color::BLACK);
@@ -635,6 +417,63 @@ int evaluate_board(Board& board) {
     return current_score;
 }
 
+// --- KIỂM TRA NƯỚC XE VÔ NGHĨA TRONG 10 NƯỚC ĐẦU ---
+// Trả về true nếu là nước Xe KHÔNG có mục đích (không ăn quân, không chiếm cột mở,
+// không tấn công quân giá trị >= 300, không tiến đến hàng 6/7/8 tính từ phía mình).
+// Nhập thành không bị ảnh hưởng vì moving.type() = KING, không phải ROOK.
+bool is_rook_move_wasteful(Board& board, Move move) {
+    // Chỉ xét trong 10 nước đầu
+    if (board.fullMoveNumber() > 10) return false;
+
+    Piece moving = board.at(move.from());
+    if (moving == Piece::NONE || moving.type() != PieceType::ROOK) return false;
+
+    // Ăn quân → có lợi
+    if (board.isCapture(move)) return false;
+
+    Color us = moving.color();
+    int to_file = move.to().index() % 8;
+    int to_rank = move.to().index() / 8;
+
+    board.makeMove(move);
+    bool useful = false;
+
+    // 1. Xe chiếm cột mở hoặc bán mở (không còn tốt mình trên cột)
+    bool own_pawn_on_file = false;
+    for (int r = 0; r < 8; r++) {
+        Piece p = board.at(Square(File(to_file), Rank(r)));
+        if (p != Piece::NONE && p.type() == PieceType::PAWN && p.color() == us) {
+            own_pawn_on_file = true;
+            break;
+        }
+    }
+    if (!own_pawn_on_file) useful = true;
+
+    // 2. Xe tấn công quân địch giá trị >= 300 (Tượng, Mã, Xe, Hậu)
+    for (int dir = 0; dir < 4 && !useful; dir++) {
+        int df = (dir == 0) ? 1 : (dir == 1) ? -1 : 0;
+        int dr = (dir == 2) ? 1 : (dir == 3) ? -1 : 0;
+        int f = to_file + df, r = to_rank + dr;
+        while (f >= 0 && f < 8 && r >= 0 && r < 8) {
+            Piece p = board.at(Square(File(f), Rank(r)));
+            if (p != Piece::NONE) {
+                if (p.color() != us && PIECE_VALUES[static_cast<int>(p.type())] >= 300) {
+                    useful = true;
+                }
+                break;
+            }
+            f += df; r += dr;
+        }
+    }
+
+    // 3. Xe tiến đến hàng 6/7/8 tính từ phía mình
+    int rel_rank = (us == Color::WHITE) ? to_rank : (7 - to_rank);
+    if (rel_rank >= 6) useful = true;
+
+    board.unmakeMove(move);
+    return !useful;
+}
+
 void order_moves(Board& board, Movelist& moves) {
     struct SM { Move m; int s; };
     std::vector<SM> sm;
@@ -652,6 +491,9 @@ void order_moves(Board& board, Movelist& moves) {
         
         if (move.promotionType() != PieceType::NONE) score += 9000;
         if (static_cast<int>(board.givesCheck(move)) != 0) score += 5000;
+
+        // Phạt nặng nước Xe vô nghĩa trong 10 nước đầu (đẩy xuống cuối)
+        if (is_rook_move_wasteful(board, move)) score -= 50000;
 
         sm.push_back({move, score});
     }
@@ -744,6 +586,9 @@ int negamax(Board& board, int depth, int alpha, int beta) {
         bool is_capture = board.isCapture(moves[i]);
         bool gives_check = static_cast<int>(board.givesCheck(moves[i])) != 0;
 
+        // Đánh dấu nước Xe vô nghĩa để phạt nhẹ sau khi tính điểm
+        bool wasteful_rook = is_rook_move_wasteful(board, moves[i]);
+
         board.makeMove(moves[i]);
         
         int extension = board.inCheck() ? 1 : 0;
@@ -765,6 +610,9 @@ int negamax(Board& board, int depth, int alpha, int beta) {
             }
         }
         board.unmakeMove(moves[i]);
+
+        // Phạt nhẹ nước Xe vô nghĩa — đủ để engine tránh nếu có lựa chọn tương đương
+        if (wasteful_rook) score -= 200;
         
         if (score > best) {
             best = score;
@@ -841,7 +689,7 @@ int main() {
                 res.set_content("{\"uci\":\"NONE\"}", "application/json"); return;
             }
 
-            // 1. Kiểm tra Opening Book trước (hỗ trợ nhiều nước đi, chọn ngẫu nhiên)
+            // 1. Kiểm tra Opening Book trước (chọn ngẫu nhiên trong tập nước chính thống)
             auto book_it = opening_book.find(fen_short);
             if (book_it != opening_book.end() && !book_it->second.empty()) {
                 const std::vector<std::string>& candidates = book_it->second;
@@ -857,7 +705,7 @@ int main() {
                         return;
                     }
                 }
-                // Nếu nước book không hợp lệ (FEN sai hoặc thiếu quyền), rơi xuống search
+                // Nếu nước book không hợp lệ → fallback sang search
             }
 
             // 2. Nếu không có trong sách, chạy thuật toán Search
