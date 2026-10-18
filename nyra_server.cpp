@@ -22,8 +22,8 @@ const char* input_names[] = {"input"};
 const char* output_names[] = {"policy", "value"};
 
 std::chrono::steady_clock::time_point start_time;
-const int TIME_LIMIT_MS = 3500; 
-const int MAX_SIMULATIONS = 150; // Vẫn giữ mức an toàn cho RAM
+const int TIME_LIMIT_MS = 3000; // Giảm thời gian xuống 3s để không bị Render ngắt
+const int MAX_SIMULATIONS = 50; // Giảm mạnh số mô phỏng để phản hồi cực nhanh
 
 class MCTSNode {
 public:
@@ -173,7 +173,6 @@ int main() {
 
     httplib::Server svr;
 
-    // THÊM ROUTE HEALTH VÀ ROOT
     svr.Get("/", [](const httplib::Request&, httplib::Response& res) {
         res.set_header("Access-Control-Allow-Origin", "*");
         res.set_content("{\"status\":\"ok\", \"engine\":\"C++ MCTS\"}", "application/json");
@@ -222,8 +221,14 @@ int main() {
         }
     });
 
-    std::cout << "Server C++ MCTS đang chạy ở cổng 8081..." << std::endl;
-    svr.listen("0.0.0.0", 8081);
+    // SỬA LỖI CỔNG: Lấy PORT từ biến môi trường của Render
+    int port = 8081;
+    if (const char* env_p = std::getenv("PORT")) {
+        port = std::stoi(env_p);
+    }
+    
+    std::cout << "Server C++ MCTS đang chạy ở cổng " << port << "..." << std::endl;
+    svr.listen("0.0.0.0", port);
     delete session;
     return 0;
 }
