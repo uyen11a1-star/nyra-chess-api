@@ -16,6 +16,68 @@ const int PIECE_VALUES[7] = {0, 100, 320, 330, 500, 900, 20000};
 const int MATE_SCORE = 100000;
 const int INF = 200000;
 
+// --- PIECE SQUARE TABLES (Dạy AI biết vị trí nào là tốt) ---
+const int PAWN_PST[64] = {
+    0,  0,  0,  0,  0,  0,  0,  0,
+    50, 50, 50, 50, 50, 50, 50, 50,
+    10, 10, 20, 30, 30, 20, 10, 10,
+     5,  5, 10, 25, 25, 10,  5,  5,
+     0,  0,  0, 20, 20,  0,  0,  0,
+     5, -5,-10,  0,  0,-10, -5,  5,
+     5, 10, 10,-20,-20, 10, 10,  5,
+     0,  0,  0,  0,  0,  0,  0,  0
+};
+const int KNIGHT_PST[64] = {
+    -50,-40,-30,-30,-30,-30,-40,-50,
+    -40,-20,  0,  0,  0,  0,-20,-40,
+    -30,  0, 10, 15, 15, 10,  0,-30,
+    -30,  5, 15, 20, 20, 15,  5,-30,
+    -30,  0, 15, 20, 20, 15,  0,-30,
+    -30,  5, 10, 15, 15, 10,  5,-30,
+    -40,-20,  0,  5,  5,  0,-20,-40,
+    -50,-40,-30,-30,-30,-30,-40,-50
+};
+const int BISHOP_PST[64] = {
+    -20,-10,-10,-10,-10,-10,-10,-20,
+    -10,  0,  0,  0,  0,  0,  0,-10,
+    -10,  0,  5, 10, 10,  5,  0,-10,
+    -10,  5,  5, 10, 10,  5,  5,-10,
+    -10,  0, 10, 10, 10, 10,  0,-10,
+    -10, 10, 10, 10, 10, 10, 10,-10,
+    -10,  5,  0,  0,  0,  0,  5,-10,
+    -20,-10,-10,-10,-10,-10,-10,-20
+};
+const int ROOK_PST[64] = {
+      0,  0,  0,  0,  0,  0,  0,  0,
+      5, 10, 10, 10, 10, 10, 10,  5,
+     -5,  0,  0,  0,  0,  0,  0, -5,
+     -5,  0,  0,  0,  0,  0,  0, -5,
+     -5,  0,  0,  0,  0,  0,  0, -5,
+     -5,  0,  0,  0,  0,  0,  0, -5,
+     -5,  0,  0,  0,  0,  0,  0, -5,
+      0,  0,  0,  5,  5,  0,  0,  0
+};
+const int QUEEN_PST[64] = {
+    -20,-10,-10, -5, -5,-10,-10,-20,
+    -10,  0,  0,  0,  0,  0,  0,-10,
+    -10,  0,  5,  5,  5,  5,  0,-10,
+     -5,  0,  5,  5,  5,  5,  0, -5,
+      0,  0,  5,  5,  5,  5,  0, -5,
+    -10,  5,  5,  5,  5,  5,  0,-10,
+    -10,  0,  5,  0,  0,  0,  0,-10,
+    -20,-10,-10, -5, -5,-10,-10,-20
+};
+const int KING_MID_PST[64] = {
+    -30,-40,-40,-50,-50,-40,-40,-30,
+    -30,-40,-40,-50,-50,-40,-40,-30,
+    -30,-40,-40,-50,-50,-40,-40,-30,
+    -30,-40,-40,-50,-50,-40,-40,-30,
+    -20,-30,-30,-40,-40,-30,-30,-20,
+    -10,-20,-20,-20,-20,-20,-20,-10,
+     20, 20,  0,  0,  0,  0, 20, 20,
+     20, 30, 10,  0,  0, 10, 30, 20
+};
+
 // --- OPENING BOOK ---
 std::unordered_map<std::string, std::string> opening_book = {
     {"r1bqkbnr/pppp1ppp/2n5/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R b KQkq -", "a7a6"},
@@ -33,8 +95,8 @@ std::unordered_map<uint64_t, TTEntry> transposition_table;
 
 std::chrono::steady_clock::time_point start_time;
 bool time_is_up = false;
-const int TIME_LIMIT_MS = 3500; // 3.5 giây an toàn tuyệt đối
-const int MAX_DEPTH = 7;        // Tăng lên 7 vì không dùng Neural nữa
+const int TIME_LIMIT_MS = 3500; 
+const int MAX_DEPTH = 6; 
 
 void init_zobrist() {
     std::mt19937_64 rng(12345);
@@ -58,14 +120,7 @@ uint64_t get_hash(const Board& board) {
     return h;
 }
 
-int center_bonus(int sq) {
-    int file_idx = sq % 8;
-    int rank_idx = sq / 8;
-    int distance = std::abs(3.5 - file_idx) + std::abs(3.5 - rank_idx);
-    return static_cast<int>(14 - 4 * distance);
-}
-
-// --- HÀM EVAL XỊN (Chỉ dùng Heuristic) ---
+// --- HÀM ĐÁNH GIÁ (KẾT HỢP PST VÀ HEURISTIC) ---
 int evaluate_white_score(Board& board) {
     int score = 0;
     int phase = 0;
@@ -88,9 +143,15 @@ int evaluate_white_score(Board& board) {
         int sign = (p.color() == Color::WHITE) ? 1 : -1;
         int pt_idx = static_cast<int>(p.type());
         int val = PIECE_VALUES[pt_idx];
-        int file = sq % 8;
-        int rank = sq / 8;
-        int relative_rank = (p.color() == Color::WHITE) ? rank : (7 - rank);
+        
+        // Lấy điểm từ PST (Bàn cờ lật ngược cho Đen)
+        int pst_sq = (p.color() == Color::WHITE) ? sq : (sq ^ 56);
+        if (p.type() == PieceType::PAWN) val += PAWN_PST[pst_sq];
+        else if (p.type() == PieceType::KNIGHT) val += KNIGHT_PST[pst_sq];
+        else if (p.type() == PieceType::BISHOP) val += BISHOP_PST[pst_sq];
+        else if (p.type() == PieceType::ROOK) val += ROOK_PST[pst_sq];
+        else if (p.type() == PieceType::QUEEN) val += QUEEN_PST[pst_sq];
+        else if (p.type() == PieceType::KING) val += KING_MID_PST[pst_sq];
 
         Square s = static_cast<Square>(sq);
         Color enemy = (p.color() == Color::WHITE) ? Color::BLACK : Color::WHITE;
@@ -102,40 +163,8 @@ int evaluate_white_score(Board& board) {
             val -= static_cast<int>(PIECE_VALUES[pt_idx] * 0.8);
         }
 
-        if (p.type() == PieceType::PAWN) {
-            val += relative_rank * 5;
-            if (file == 3 || file == 4) val += 5;
-            bool blocked = false;
-            for (int e_sq = 0; e_sq < 64; e_sq++) {
-                Piece ep = board.at(e_sq);
-                if (ep != Piece::NONE && ep.type() == PieceType::PAWN && ep.color() != p.color()) {
-                    int ef = e_sq % 8;
-                    int er = e_sq / 8;
-                    int e_rel_rank = (p.color() == Color::BLACK) ? er : (7 - er);
-                    if (std::abs(ef - file) <= 1 && e_rel_rank > relative_rank) {
-                        blocked = true; break;
-                    }
-                }
-            }
-            if (!blocked) val += 8 + relative_rank * relative_rank * 2;
-
-        } else if (p.type() == PieceType::KNIGHT) {
-            val += center_bonus(sq);
-            if (relative_rank >= 2 && relative_rank <= 5 && is_defended) val += 25;
-        } else if (p.type() == PieceType::BISHOP) {
-            val += center_bonus(sq) / 2;
-        } else if (p.type() == PieceType::ROOK) {
-            // PHẠT NẶNG XE ĐI RA BIÊN HOẶC ĐI LÙI SỚM
-            if (board.fullMoveNumber() <= 15) {
-                if (file == 0 || file == 7) val -= 30;
-                if ((p.color() == Color::WHITE && rank == 0) || (p.color() == Color::BLACK && rank == 7)) {
-                    val -= 20; // Phạt Xe nằm ở hàng cuối
-                }
-            }
-            if (relative_rank == 6) val += 15; // Rook on 7th rank
-        } else if (p.type() == PieceType::QUEEN) {
-            if (board.fullMoveNumber() <= 10) val -= 15; // Phạt Hậu ra sớm
-        }
+        // Phạt Hậu ra sớm
+        if (p.type() == PieceType::QUEEN && board.fullMoveNumber() <= 10) val -= 15;
 
         score += sign * val;
     }
@@ -179,40 +208,63 @@ int evaluate_white_score(Board& board) {
         }
 
         if (!endgame && board.fullMoveNumber() <= 20 && kr != home_rank && !castled) {
-            score -= sign * 45; // Phạt Vua đi lang thang
+            score -= sign * 45; 
         }
     }
 
     return score;
 }
 
+// --- LOGIC CHỐNG LẶP THÔNG MINH ---
 int evaluate_board(Board& board) {
     if (board.isGameOver().second == GameResult::LOSE) return -MATE_SCORE;
     if (board.isGameOver().second == GameResult::DRAW) return 0;
-    if (board.isRepetition(2)) return 0; // Chống lặp
 
     int score = evaluate_white_score(board);
-    
-    // Thêm nhiễu để phá hòa
+    int current_score = (board.sideToMove() == Color::WHITE) ? score : -score;
+
+    // Nếu thế cờ lặp lại 2 lần
+    if (board.isRepetition(2)) {
+        // Nếu đang có lợi thế lớn mà lại chọn đi lặp để hòa -> Phạt nặng
+        if (current_score > 100) return -500; 
+        // Nếu đang bất lợi mà đi lặp để hòa -> Thưởng nhẹ
+        if (current_score < -100) return 50;
+        return 0;
+    }
+
+    // Nhiễu nhỏ để phá cân bằng
     static std::mt19937 gen(std::random_device{}());
-    std::uniform_int_distribution<> distr(-10, 10);
-    score += distr(gen);
+    std::uniform_int_distribution<> distr(-5, 5);
+    current_score += distr(gen);
     
-    return (board.sideToMove() == Color::WHITE) ? score : -score;
+    return current_score;
 }
 
-void order_moves_mvv_lva(Board& board, Movelist& moves) {
+void order_moves(Board& board, Movelist& moves) {
     struct SM { Move m; int s; };
     std::vector<SM> sm;
     sm.reserve(moves.size());
+    
     for (int i = 0; i < moves.size(); i++) {
+        Move move = moves[i];
         int score = 0;
-        if (board.isCapture(moves[i])) {
-            Piece victim = board.at(moves[i].to());
-            if (victim != Piece::NONE) score = 10 * PIECE_VALUES[static_cast<int>(victim.type())] - PIECE_VALUES[static_cast<int>(board.at(moves[i].from()).type())];
-            else score = 1000;
+        
+        // 1. Ưu tiên ăn quân (MVV-LVA)
+        if (board.isCapture(move)) {
+            Piece victim = board.at(move.to());
+            if (victim != Piece::NONE) score += 10000 + 10 * PIECE_VALUES[static_cast<int>(victim.type())] - PIECE_VALUES[static_cast<int>(board.at(move.from()).type())];
+            else score += 10000; // En passant
         }
-        sm.push_back({moves[i], score});
+        
+        // 2. Ưu tiên phong cấp
+        if (move.typeOf() == Move::Type::PROMOTION) score += 9000;
+        
+        // 3. Ưu tiên phát triển quân (Từ hàng cuối đi lên)
+        int from_rank = move.from().index() / 8;
+        if (board.sideToMove() == Color::WHITE && from_rank == 0) score += 500;
+        if (board.sideToMove() == Color::BLACK && from_rank == 7) score += 500;
+
+        sm.push_back({move, score});
     }
     std::sort(sm.begin(), sm.end(), [](const SM& a, const SM& b) { return a.s > b.s; });
     for (int i = 0; i < moves.size(); i++) moves[i] = sm[i].m;
@@ -229,7 +281,7 @@ int quiescence(Board& board, int alpha, int beta) {
     for(int i=0; i<moves.size(); i++) {
         if(board.isCapture(moves[i])) capture_moves.add(moves[i]);
     }
-    order_moves_mvv_lva(board, capture_moves);
+    order_moves(board, capture_moves);
 
     for (int i = 0; i < capture_moves.size(); i++) {
         board.makeMove(capture_moves[i]);
@@ -273,7 +325,7 @@ int negamax(Board& board, int depth, int alpha, int beta, bool root = false) {
     Movelist moves; movegen::legalmoves(moves, board);
     if (moves.size() == 0) return in_check ? -MATE_SCORE + depth : 0;
     
-    order_moves_mvv_lva(board, moves);
+    order_moves(board, moves);
     
     int best = -INF;
     Move best_move_in_node = moves[0];
@@ -330,7 +382,7 @@ std::string extract_fen(const std::string& body) {
 
 int main() {
     init_zobrist();
-    std::cout << "Khởi động Nyra Engine (Thuần Heuristic)..." << std::endl;
+    std::cout << "Khởi động Nyra Engine (PST + Heuristic)..." << std::endl;
 
     httplib::Server svr;
 
@@ -371,7 +423,7 @@ int main() {
 
             transposition_table.clear();
             transposition_table.reserve(100000); 
-            order_moves_mvv_lva(board, moves); // Dùng MVV-LVA thay vì NN
+            order_moves(board, moves);
             
             int best_score = -INF;
             Move best_move = moves[0];
