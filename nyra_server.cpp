@@ -28,14 +28,14 @@ const int PAWN_PST[64] = {
      0,  0,  0,  0,  0,  0,  0,  0
 };
 const int KNIGHT_PST[64] = {
-    -100,-100,-100,-100,-100,-100,-100,-100, 
-    -100,-20,  0,  0,  0,  0,-20,-100,
-    -100,  0, 10, 15, 15, 10,  0,-100,
-    -100,  5, 15, 30, 30, 15,  5,-100, 
-    -100,  0, 15, 30, 30, 15,  0,-100,
-    -100,  5, 10, 15, 15, 10,  5,-100,
-    -100,-20,  0,  5,  5,  0,-20,-100,
-    -100,-100,-100,-100,-100,-100,-100,-100
+    -50,-40,-30,-30,-30,-30,-40,-50,
+    -40,-20,  0,  0,  0,  0,-20,-40,
+    -30,  0, 10, 15, 15, 10,  0,-30,
+    -30,  5, 15, 20, 20, 15,  5,-30,
+    -30,  0, 15, 20, 20, 15,  0,-30,
+    -30,  5, 10, 15, 15, 10,  5,-30,
+    -40,-20,  0,  5,  5,  0,-20,-40,
+    -50,-40,-30,-30,-30,-30,-40,-50
 };
 const int BISHOP_PST[64] = {
     -20,-10,-10,-10,-10,-10,-10,-20,
@@ -78,8 +78,12 @@ const int KING_MID_PST[64] = {
      20, 30, 10,  0,  0, 10, 30, 20
 };
 
+// --- ZOBRIST HASHING (Đã sửa lỗi thiếu Castling và En Passant) ---
 uint64_t zobrist_pieces[7][2][64];
 uint64_t zobrist_turn;
+uint64_t zobrist_castling[16];
+uint64_t zobrist_ep[8];
+
 enum TTFlag { EXACT, LOWERBOUND, UPPERBOUND };
 struct TTEntry { int depth; int score; TTFlag flag; Move best_move; };
 std::unordered_map<uint64_t, TTEntry> transposition_table;
@@ -96,6 +100,8 @@ void init_zobrist() {
             for (int sq = 0; sq < 64; sq++)
                 zobrist_pieces[pt][c][sq] = rng();
     zobrist_turn = rng();
+    for (int i = 0; i < 16; i++) zobrist_castling[i] = rng();
+    for (int i = 0; i < 8; i++) zobrist_ep[i] = rng();
 }
 
 uint64_t get_hash(const Board& board) {
@@ -108,6 +114,19 @@ uint64_t get_hash(const Board& board) {
         }
     }
     if (board.sideToMove() == Color::WHITE) h ^= zobrist_turn;
+    
+    // Hash Castling Rights
+    int castling_idx = 0;
+    if (board.castlingRights().has(CastlingRights::WhiteKingSide)) castling_idx |= 1;
+    if (board.castlingRights().has(CastlingRights::WhiteQueenSide)) castling_idx |= 2;
+    if (board.castlingRights().has(CastlingRights::BlackKingSide)) castling_idx |= 4;
+    if (board.castlingRights().has(CastlingRights::BlackQueenSide)) castling_idx |= 8;
+    h ^= zobrist_castling[castling_idx];
+
+    // Hash En Passant
+    if (board.enpassantSq() != Square::underlying::NO_SQ) {
+        h ^= zobrist_ep[board.enpassantSq().index() % 8];
+    }
     return h;
 }
 
@@ -151,24 +170,6 @@ int evaluate_white_score(Board& board) {
         // Phạt quân bị treo
         if (is_attacked && !is_defended && p.type() != PieceType::KING) {
             val -= static_cast<int>(PIECE_VALUES[pt_idx] * 0.8);
-        }
-
-        // Phạt Tốt bị bỏ rơi (không có Tốt bên cạnh bảo vệ) ở giai đoạn đầu
-        if (p.type() == PieceType::PAWN && !endgame) {
-            int file = (sq % 8);
-            bool has_pawn_neighbor = false;
-            for (int df = -1; df <= 1; df += 2) {
-                int nf = file + df;
-                if (nf >= 0 && nf < 8) {
-                    for (int r = 0; r < 8; r++) {
-                        Piece neighbor = board.at(chess::Square(chess::File(nf), chess::Rank(r)));
-                        if (neighbor != Piece::NONE && neighbor.type() == PieceType::PAWN && neighbor.color() == p.color()) {
-                            has_pawn_neighbor = true;
-                        }
-                    }
-                }
-            }
-            if (!has_pawn_neighbor) val -= 15; // Phạt Tốt cô lập
         }
 
         if (board.fullMoveNumber() <= 10 && p.type() == PieceType::QUEEN) val -= 20;
@@ -235,46 +236,6 @@ int evaluate_board(Board& board) {
     return current_score;
 }
 
-// --- HÀM LỌC NƯỚC ĐI (LOẠI BỎ NƯỚC NGU) ---
-Movelist get_safe_moves(Board& board) {
-    Movelist all_moves;
-    movegen::legalmoves(all_moves, board);
-    Movelist safe_moves;
-
-    for (int i = 0; i < all_moves.size(); i++) {
-        Move move = all_moves[i];
-        bool is_bad = false;
-
-        // Nếu là 15 nước đầu tiên
-        if (board.fullMoveNumber() <= 15) {
-            Piece p = board.at(move.from());
-            int to_file = move.to().index() % 8;
-            
-            // 1. Cấm Mã ra biên
-            if (p != Piece::NONE && p.type() == PieceType::KNIGHT) {
-                if (to_file == 0 || to_file == 7) {
-                    is_bad = true;
-                }
-            }
-            // 2. Cấm đẩy Tốt biên (a, h)
-            if (p != Piece::NONE && p.type() == PieceType::PAWN && !board.isCapture(move)) {
-                int from_file = move.from().index() % 8;
-                if (from_file == 0 || from_file == 7) {
-                    is_bad = true;
-                }
-            }
-        }
-
-        if (!is_bad) {
-            safe_moves.add(move);
-        }
-    }
-
-    // Nếu cấm hết không còn nước nào (hiếm), trả về tất cả
-    if (safe_moves.size() == 0) return all_moves;
-    return safe_moves;
-}
-
 void order_moves(Board& board, Movelist& moves) {
     struct SM { Move m; int s; };
     std::vector<SM> sm;
@@ -298,30 +259,45 @@ void order_moves(Board& board, Movelist& moves) {
     for (int i = 0; i < moves.size(); i++) moves[i] = sm[i].m;
 }
 
+// --- SỬA LỖI 3: QUIESCENCE XỬ LÝ NƯỚC THOÁT CHIẾU ---
 int quiescence(Board& board, int alpha, int beta) {
     if (time_is_up) return evaluate_board(board);
-    int stand_pat = evaluate_board(board);
-    if (stand_pat >= beta) return beta;
-    if (alpha < stand_pat) alpha = stand_pat;
+    
+    bool in_check = board.inCheck();
+    
+    // Nếu không bị chiếu, mới được phép đánh giá tĩnh (Stand pat)
+    if (!in_check) {
+        int stand_pat = evaluate_board(board);
+        if (stand_pat >= beta) return beta;
+        if (alpha < stand_pat) alpha = stand_pat;
+    }
 
     Movelist moves; movegen::legalmoves(moves, board);
-    Movelist capture_moves;
-    for(int i=0; i<moves.size(); i++) {
-        if(board.isCapture(moves[i])) capture_moves.add(moves[i]);
-    }
-    order_moves(board, capture_moves);
+    if (moves.size() == 0) return in_check ? -MATE_SCORE : 0; // Chiếu hết hoặc hòa
 
-    for (int i = 0; i < capture_moves.size(); i++) {
-        board.makeMove(capture_moves[i]);
+    Movelist search_moves;
+    for(int i=0; i<moves.size(); i++) {
+        // Nếu đang bị chiếu, phải duyệt TẤT CẢ các nước đi hợp lệ để thoát chiếu
+        // Nếu không bị chiếu, chỉ duyệt các nước ăn quân
+        if (in_check || board.isCapture(moves[i])) {
+            search_moves.add(moves[i]);
+        }
+    }
+    
+    order_moves(board, search_moves);
+
+    for (int i = 0; i < search_moves.size(); i++) {
+        board.makeMove(search_moves[i]);
         int score = -quiescence(board, -beta, -alpha);
-        board.unmakeMove(capture_moves[i]);
+        board.unmakeMove(search_moves[i]);
         if (score >= beta) return beta;
         if (score > alpha) alpha = score;
     }
     return alpha;
 }
 
-int negamax(Board& board, int depth, int alpha, int beta, bool root = false) {
+// --- SỬA LỖI 2: NEGAMAX KIỂM TRA CAPTURE/CHECK TRƯỚC KHI MAKE MOVE ---
+int negamax(Board& board, int depth, int alpha, int beta) {
     if (time_is_up) return evaluate_board(board);
 
     static int nodes = 0;
@@ -350,10 +326,7 @@ int negamax(Board& board, int depth, int alpha, int beta, bool root = false) {
         }
     }
 
-    Movelist moves;
-    if (root) moves = get_safe_moves(board); // Chỉ dùng nước an toàn ở gốc
-    else movegen::legalmoves(moves, board);
-    
+    Movelist moves; movegen::legalmoves(moves, board);
     if (moves.size() == 0) return in_check ? -MATE_SCORE + depth : 0;
     
     order_moves(board, moves);
@@ -363,15 +336,21 @@ int negamax(Board& board, int depth, int alpha, int beta, bool root = false) {
     TTFlag flag = UPPERBOUND;
 
     for (int i = 0; i < moves.size(); i++) {
+        // LƯU Ý QUAN TRỌNG: Lấy thông tin nước đi TRƯỚC KHI thực hiện
+        bool is_capture = board.isCapture(moves[i]);
+        bool gives_check = board.givesCheck(moves[i]);
+
         board.makeMove(moves[i]);
+        
         int extension = board.inCheck() ? 1 : 0;
-        int score;
         int new_depth = depth - 1 + extension;
 
-        if (i >= 3 && depth >= 3 && !in_check && !board.isCapture(moves[i]) && static_cast<int>(board.givesCheck(moves[i])) == 0) {
+        // Bây giờ mới dùng đúng thông tin đã lưu để áp dụng LMR
+        if (i >= 3 && depth >= 3 && !in_check && !is_capture && !gives_check) {
             new_depth -= 1; 
         }
 
+        int score;
         if (i == 0) {
             score = -negamax(board, new_depth, -beta, -alpha);
         } else {
@@ -418,7 +397,7 @@ std::string extract_fen(const std::string& body) {
 
 int main() {
     init_zobrist();
-    std::cout << "Khởi động Nyra Engine (Bản Cấm Nước Ngớ Ngẩn)..." << std::endl;
+    std::cout << "Khởi động Nyra Engine (Đã sửa toàn bộ lỗi)..." << std::endl;
 
     httplib::Server svr;
 
@@ -449,8 +428,9 @@ int main() {
 
             Board board = Board(fen);
             
-            // Lấy danh sách nước đi đã qua bộ lọc
-            Movelist moves = get_safe_moves(board);
+            // SỬA LỖI 1: Bỏ bộ lọc cấm nước đi, lấy toàn bộ nước hợp lệ
+            Movelist moves; 
+            movegen::legalmoves(moves, board);
             
             if (moves.size() == 0) {
                 res.set_content("{\"uci\":\"NONE\"}", "application/json"); return;
@@ -473,37 +453,22 @@ int main() {
                 int current_best_score = -INF;
                 Move current_best_move = moves[0];
                 
+                // SỬA LỖI 4: Bỏ Aspiration Window để tránh vòng lặp vô hạn
                 int alpha = -INF;
                 int beta = INF;
-                if (depth >= 4 && completed_depth > 0) {
-                    alpha = std::max(-INF, best_score - 50);
-                    beta = std::min(INF, best_score + 50);
-                }
 
-                while (true) {
-                    bool break_while = false;
-                    for (int i = 0; i < moves.size(); i++) {
-                        board.makeMove(moves[i]);
-                        int score = -negamax(board, depth - 1, -beta, -alpha);
-                        board.unmakeMove(moves[i]);
+                for (int i = 0; i < moves.size(); i++) {
+                    board.makeMove(moves[i]);
+                    int score = -negamax(board, depth - 1, -beta, -alpha);
+                    board.unmakeMove(moves[i]);
 
-                        if (time_is_up) { break_while = true; break; }
+                    if (time_is_up) break;
 
-                        if (score > current_best_score) {
-                            current_best_score = score;
-                            current_best_move = moves[i];
-                        }
-                        if (score > alpha) alpha = score;
-                        if (alpha >= beta) break;
+                    if (score > current_best_score) {
+                        current_best_score = score;
+                        current_best_move = moves[i];
                     }
-                    
-                    if (break_while || time_is_up) break;
-
-                    if (current_best_score <= best_score - 50) {
-                        beta = alpha + 1; alpha = -INF;
-                    } else if (current_best_score >= best_score + 50) {
-                        alpha = beta - 1; beta = INF;
-                    } else break;
+                    if (score > alpha) alpha = score;
                 }
 
                 if (!time_is_up) {
