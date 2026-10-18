@@ -78,7 +78,7 @@ const int KING_MID_PST[64] = {
      20, 30, 10,  0,  0, 10, 30, 20
 };
 
-// --- ZOBRIST HASHING (Đã sửa lỗi thiếu Castling và En Passant) ---
+// --- ZOBRIST HASHING ---
 uint64_t zobrist_pieces[7][2][64];
 uint64_t zobrist_turn;
 uint64_t zobrist_castling[16];
@@ -115,15 +115,10 @@ uint64_t get_hash(const Board& board) {
     }
     if (board.sideToMove() == Color::WHITE) h ^= zobrist_turn;
     
-    // Hash Castling Rights
-    int castling_idx = 0;
-    if (board.castlingRights().has(CastlingRights::WhiteKingSide)) castling_idx |= 1;
-    if (board.castlingRights().has(CastlingRights::WhiteQueenSide)) castling_idx |= 2;
-    if (board.castlingRights().has(CastlingRights::BlackKingSide)) castling_idx |= 4;
-    if (board.castlingRights().has(CastlingRights::BlackQueenSide)) castling_idx |= 8;
-    h ^= zobrist_castling[castling_idx];
+    // SỬA LỖI 1: CastlingRights trả về bitmask (int)
+    int castling = static_cast<int>(board.castlingRights());
+    h ^= zobrist_castling[castling];
 
-    // Hash En Passant
     if (board.enpassantSq() != Square::underlying::NO_SQ) {
         h ^= zobrist_ep[board.enpassantSq().index() % 8];
     }
@@ -167,7 +162,6 @@ int evaluate_white_score(Board& board) {
         bool is_attacked = board.isAttacked(s, enemy);
         bool is_defended = board.isAttacked(s, p.color());
         
-        // Phạt quân bị treo
         if (is_attacked && !is_defended && p.type() != PieceType::KING) {
             val -= static_cast<int>(PIECE_VALUES[pt_idx] * 0.8);
         }
@@ -259,13 +253,11 @@ void order_moves(Board& board, Movelist& moves) {
     for (int i = 0; i < moves.size(); i++) moves[i] = sm[i].m;
 }
 
-// --- SỬA LỖI 3: QUIESCENCE XỬ LÝ NƯỚC THOÁT CHIẾU ---
 int quiescence(Board& board, int alpha, int beta) {
     if (time_is_up) return evaluate_board(board);
     
     bool in_check = board.inCheck();
     
-    // Nếu không bị chiếu, mới được phép đánh giá tĩnh (Stand pat)
     if (!in_check) {
         int stand_pat = evaluate_board(board);
         if (stand_pat >= beta) return beta;
@@ -273,12 +265,10 @@ int quiescence(Board& board, int alpha, int beta) {
     }
 
     Movelist moves; movegen::legalmoves(moves, board);
-    if (moves.size() == 0) return in_check ? -MATE_SCORE : 0; // Chiếu hết hoặc hòa
+    if (moves.size() == 0) return in_check ? -MATE_SCORE : 0;
 
     Movelist search_moves;
     for(int i=0; i<moves.size(); i++) {
-        // Nếu đang bị chiếu, phải duyệt TẤT CẢ các nước đi hợp lệ để thoát chiếu
-        // Nếu không bị chiếu, chỉ duyệt các nước ăn quân
         if (in_check || board.isCapture(moves[i])) {
             search_moves.add(moves[i]);
         }
@@ -296,7 +286,6 @@ int quiescence(Board& board, int alpha, int beta) {
     return alpha;
 }
 
-// --- SỬA LỖI 2: NEGAMAX KIỂM TRA CAPTURE/CHECK TRƯỚC KHI MAKE MOVE ---
 int negamax(Board& board, int depth, int alpha, int beta) {
     if (time_is_up) return evaluate_board(board);
 
@@ -336,16 +325,16 @@ int negamax(Board& board, int depth, int alpha, int beta) {
     TTFlag flag = UPPERBOUND;
 
     for (int i = 0; i < moves.size(); i++) {
-        // LƯU Ý QUAN TRỌNG: Lấy thông tin nước đi TRƯỚC KHI thực hiện
         bool is_capture = board.isCapture(moves[i]);
-        bool gives_check = board.givesCheck(moves[i]);
+        
+        // SỬA LỖI 2: Ép enum CheckType về int để so sánh với 0
+        bool gives_check = static_cast<int>(board.givesCheck(moves[i])) != 0;
 
         board.makeMove(moves[i]);
         
         int extension = board.inCheck() ? 1 : 0;
         int new_depth = depth - 1 + extension;
 
-        // Bây giờ mới dùng đúng thông tin đã lưu để áp dụng LMR
         if (i >= 3 && depth >= 3 && !in_check && !is_capture && !gives_check) {
             new_depth -= 1; 
         }
@@ -397,7 +386,7 @@ std::string extract_fen(const std::string& body) {
 
 int main() {
     init_zobrist();
-    std::cout << "Khởi động Nyra Engine (Đã sửa toàn bộ lỗi)..." << std::endl;
+    std::cout << "Khởi động Nyra Engine..." << std::endl;
 
     httplib::Server svr;
 
@@ -428,7 +417,6 @@ int main() {
 
             Board board = Board(fen);
             
-            // SỬA LỖI 1: Bỏ bộ lọc cấm nước đi, lấy toàn bộ nước hợp lệ
             Movelist moves; 
             movegen::legalmoves(moves, board);
             
@@ -453,7 +441,6 @@ int main() {
                 int current_best_score = -INF;
                 Move current_best_move = moves[0];
                 
-                // SỬA LỖI 4: Bỏ Aspiration Window để tránh vòng lặp vô hạn
                 int alpha = -INF;
                 int beta = INF;
 
