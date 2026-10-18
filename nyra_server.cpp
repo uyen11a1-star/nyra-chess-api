@@ -9,7 +9,6 @@
 #include <string>
 #include <unordered_map>
 #include <random>
-#include <sstream>
 
 using namespace chess;
 
@@ -79,30 +78,16 @@ const int KING_MID_PST[64] = {
      20, 30, 10,  0,  0, 10, 30, 20
 };
 
-// --- MỞ RỘNG OPENING BOOK ---
+// --- OPENING BOOK ---
 std::unordered_map<std::string, std::string> opening_book = {
-    // 1. e4 (Open Game)
     {"rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq -", "e7e5"},
-    // 1. e4 c5 (Sicilian)
     {"rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq -", "c7c5"},
-    // 1. e4 e6 (French)
-    {"rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq -", "e7e6"},
-    // 1. e4 c6 (Caro-Kann)
-    {"rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq -", "c7c6"},
-    // 1. d4
     {"rnbqkbnr/pppppppp/8/8/3P4/8/PPP1PPPP/RNBQKBNR b KQkq -", "d7d5"},
-    // 1. d4 d5 2. c4 (Queen's Gambit)
-    {"rnbqkbnr/ppp1pppp/8/3p4/2PP4/8/PP2PPPP/RNBQKBNR b KQkq -", "e7e6"},
-    // 1. e4 e5 2. Nf3
-    {"rnbqkbnr/pppp1ppp/8/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R b KQkq -", "b8c6"},
-    // 1. e4 e5 2. Nf3 Nc6 3. Bc4 (Khai cuộc Italia)
-    {"r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R b KQkq -", "f8c5"},
-    // 1. e4 e5 2. Nf3 Nc6 3. Bb5 (Ruy Lopez)
+    {"rnbqkbnr/pppppppp/8/8/3P4/8/PPP1PPPP/RNBQKBNR b KQkq -", "g8f6"},
+    {"r1bqk1nr/pppp1ppp/2n5/2b1p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq -", "c2c3"},
     {"r1bqkbnr/pppp1ppp/2n5/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R b KQkq -", "a7a6"},
-    // 1. e4 e5 2. f4 (King's Gambit)
-    {"rnbqkbnr/pppp1ppp/8/4p3/4PP2/8/PPPP2PP/RNBQKBNR b KQkq -", "e5f4"},
-    // 1. e4 e5 2. Nf3 Nc6 3. Bc4 Bc5 4. c3 (Giuoco Piano)
-    {"r1bqk1nr/pppp1ppp/2n5/2b1p3/2B1P3/2P2N2/PP1P1PPP/RNBQK2R b KQkq -", "g8f6"}
+    {"rnbqkbnr/pp2pppp/3p4/2p5/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq -", "d2d4"},
+    {"rnbqkbnr/pppp1ppp/4p3/8/3PP3/8/PPP2PPP/RNBQKBNR b KQkq -", "d7d5"}
 };
 
 // --- ZOBRIST HASHING ---
@@ -169,9 +154,6 @@ uint64_t get_hash(const Board& board) {
     return h;
 }
 
-// ============================================================
-// HÀM ĐÁNH GIÁ
-// ============================================================
 int evaluate_white_score(Board& board) {
     int score = 0;
     int phase = 0;
@@ -208,14 +190,8 @@ int evaluate_white_score(Board& board) {
 
         bool is_attacked = board.isAttacked(s, enemy);
         bool is_defended = board.isAttacked(s, p.color());
-        
         if (is_attacked && !is_defended && p.type() != PieceType::KING) {
             val -= static_cast<int>(PIECE_VALUES[pt_idx] * 0.9);
-        }
-
-        if (p.type() == PieceType::ROOK && board.fullMoveNumber() <= 15) {
-            int file = sq % 8;
-            if (file == 0 || file == 7) val -= 40; 
         }
 
         if (board.fullMoveNumber() <= 10 && p.type() == PieceType::QUEEN) val -= 20;
@@ -333,7 +309,7 @@ int evaluate_white_score(Board& board) {
                         (color == Color::BLACK && kr == 7 && (kf == 2 || kf == 6)));
 
         if (castled) {
-            score += sign * 100; 
+            score += sign * 70;
             int direction = (color == Color::WHITE) ? 1 : -1;
             int shield = 0;
             for (int df = -1; df <= 1; df++) {
@@ -345,11 +321,10 @@ int evaluate_white_score(Board& board) {
             }
             if (shield == 0) score -= sign * 60;
             else if (shield == 1) score -= sign * 30;
-        } else {
-            if (board.fullMoveNumber() > 10) score -= sign * 60;
-            if (!endgame && board.fullMoveNumber() <= 20 && kr != home_rank) {
-                score -= sign * 55; 
-            }
+        }
+
+        if (!endgame && board.fullMoveNumber() <= 20 && kr != home_rank && !castled) {
+            score -= sign * 45; 
         }
     }
 
@@ -360,12 +335,12 @@ int evaluate_white_score(Board& board) {
                 int bf = bk.index() % 8;
                 int br = bk.index() / 8;
                 int edge_dist = std::min(std::min(bf, 7 - bf), std::min(br, 7 - br));
-                score += (7 - edge_dist) * 20; 
+                score += (7 - edge_dist) * 20;
                 
                 Square wk = board.kingSq(Color::WHITE);
                 if (wk != Square::underlying::NO_SQ) {
                     int dist = std::abs((wk.index() % 8) - bf) + std::abs((wk.index() / 8) - br);
-                    score += (14 - dist) * 10; 
+                    score += (14 - dist) * 10;
                 }
             }
         } else if (score < -300) {
@@ -374,7 +349,7 @@ int evaluate_white_score(Board& board) {
                 int wf = wk.index() % 8;
                 int wr = wk.index() / 8;
                 int edge_dist = std::min(std::min(wf, 7 - wf), std::min(wr, 7 - wr));
-                score -= (7 - edge_dist) * 20; 
+                score -= (7 - edge_dist) * 20;
                 
                 Square bk = board.kingSq(Color::BLACK);
                 if (bk != Square::underlying::NO_SQ) {
@@ -404,7 +379,7 @@ int evaluate_board(Board& board) {
 }
 
 // ============================================================
-// HÀM LỌC NƯỚC ĐI (CHẶN XE ĐI VÔ NGHĨA)
+// HÀM CHẶN XE ĐI VÔ NGHĨA TRONG 10 NƯỚC ĐẦU
 // ============================================================
 Movelist get_safe_moves(Board& board) {
     Movelist all_moves;
@@ -415,21 +390,14 @@ Movelist get_safe_moves(Board& board) {
         Move move = all_moves[i];
         bool is_bad = false;
 
-        // Nếu là 10 nước đầu tiên VÀ nước đi không phải ăn quân/chiếu tướng
         if (board.fullMoveNumber() <= 10 && !board.isCapture(move) && static_cast<int>(board.givesCheck(move)) == 0) {
             Piece p = board.at(move.from());
-            // Cấm Xe di chuyển lung tung
             if (p != Piece::NONE && p.type() == PieceType::ROOK) {
                 is_bad = true;
             }
         }
-
-        if (!is_bad) {
-            safe_moves.add(move);
-        }
+        if (!is_bad) safe_moves.add(move);
     }
-
-    // Nếu bị kẹt không còn nước nào (hiếm), trả về tất cả
     if (safe_moves.size() == 0) return all_moves;
     return safe_moves;
 }
@@ -530,7 +498,7 @@ int negamax(Board& board, int depth, int alpha, int beta) {
         }
     }
 
-    Movelist moves = get_safe_moves(board); // Sử dụng bộ lọc chặn Xe đi vô nghĩa
+    Movelist moves = get_safe_moves(board);
     if (moves.size() == 0) return in_check ? -MATE_SCORE + depth : 0;
     
     order_moves(board, moves);
@@ -597,18 +565,9 @@ std::string extract_fen(const std::string& body) {
     return body.substr(start, end - start);
 }
 
-std::string get_short_fen(const std::string& full_fen) {
-    std::istringstream iss(full_fen);
-    std::string board, turn, castling, ep;
-    if (iss >> board >> turn >> castling >> ep) {
-        return board + " " + turn + " " + castling + " " + ep;
-    }
-    return full_fen;
-}
-
 int main() {
     init_zobrist();
-    std::cout << "Khởi động Nyra Engine..." << std::endl;
+    std::cout << "Khởi động Nyra Engine (Book + Endgame + Anti-Rook)..." << std::endl;
 
     httplib::Server svr;
 
@@ -637,10 +596,11 @@ int main() {
                 res.status = 400; res.set_content("{\"error\":\"No FEN\"}", "application/json"); return;
             }
 
-            std::string fen_short = get_short_fen(fen); 
+            std::string fen_short = fen.substr(0, fen.find_last_of(" "));
+            fen_short = fen_short.substr(0, fen_short.find_last_of(" ")); 
 
             Board board = Board(fen);
-            Movelist moves = get_safe_moves(board); // Lọc ngay ở gốc
+            Movelist moves = get_safe_moves(board);
             
             if (moves.size() == 0) {
                 res.set_content("{\"uci\":\"NONE\"}", "application/json"); return;
@@ -713,7 +673,7 @@ int main() {
     int port = 8081;
     if (const char* env_p = std::getenv("PORT")) port = std::stoi(env_p);
     
-    std::cout << "Server đang chạy ở cổng " << port << std::endl;
+    std::cout << "Server đang chạy ở cổng " << port << "..." << std::endl;
     svr.listen("0.0.0.0", port);
     return 0;
 }
