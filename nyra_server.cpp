@@ -78,11 +78,14 @@ const int KING_MID_PST[64] = {
      20, 30, 10,  0,  0, 10, 30, 20
 };
 
-// --- MỞ RỘNG OPENING BOOK (Bao gồm cả phản ứng với 1. e4) ---
+// --- OPENING BOOK MỞ RỘNG ---
 std::unordered_map<std::string, std::string> opening_book = {
-    // 1. e4 ...
-    {"rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq -", "e7e5"}, 
+    // Trả lời 1. e4
+    {"rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq -", "e7e5"},
     {"rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq -", "c7c5"},
+    // Trả lời 1. d4
+    {"rnbqkbnr/pppppppp/8/8/3P4/8/PPP1PPPP/RNBQKBNR b KQkq -", "d7d5"},
+    {"rnbqkbnr/pppppppp/8/8/3P4/8/PPP1PPPP/RNBQKBNR b KQkq -", "g8f6"},
     // Ruy Lopez
     {"r1bqkbnr/pppp1ppp/2n5/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R b KQkq -", "a7a6"},
     // Italian Game
@@ -168,7 +171,19 @@ int evaluate_white_score(Board& board) {
             val -= static_cast<int>(PIECE_VALUES[pt_idx] * 0.8);
         }
 
-        if (p.type() == PieceType::QUEEN && board.fullMoveNumber() <= 10) val -= 15;
+        // PHẠT NẶNG TỐT BIÊN VÀ HẬU RA SỚM TRONG KHAI CUỘC
+        if (board.fullMoveNumber() <= 10) {
+            if (p.type() == PieceType::PAWN) {
+                int f = sq % 8;
+                int r = sq / 8;
+                if (f == 0 || f == 7) {
+                    if ((p.color() == Color::WHITE && r > 1) || (p.color() == Color::BLACK && r < 6)) {
+                        val -= 50; // Phạt đẩy tốt biên
+                    }
+                }
+            }
+            if (p.type() == PieceType::QUEEN) val -= 20; // Phạt Hậu ra sớm
+        }
 
         score += sign * val;
     }
@@ -229,12 +244,9 @@ int evaluate_board(Board& board) {
         if (current_score < -100) return 50;
         return 0;
     }
-
-    // Đã xóa Random Noise để AI chơi nghiêm túc hơn
     return current_score;
 }
 
-// --- SỬA LỖI SẮP XẾP NƯỚC ĐI (Bỏ ưu tiên 500 điểm vô lý) ---
 void order_moves(Board& board, Movelist& moves) {
     struct SM { Move m; int s; };
     std::vector<SM> sm;
@@ -244,14 +256,12 @@ void order_moves(Board& board, Movelist& moves) {
         Move move = moves[i];
         int score = 0;
         
-        // 1. Ưu tiên ăn quân (MVV-LVA)
         if (board.isCapture(move)) {
             Piece victim = board.at(move.to());
             if (victim != Piece::NONE) score += 10000 + 10 * PIECE_VALUES[static_cast<int>(victim.type())] - PIECE_VALUES[static_cast<int>(board.at(move.from()).type())];
             else score += 10000; 
         }
         
-        // 2. Ưu tiên phong cấp
         if (move.promotionType() != PieceType::NONE) score += 9000;
 
         sm.push_back({move, score});
@@ -391,7 +401,6 @@ int main() {
                 res.status = 400; res.set_content("{\"error\":\"No FEN\"}", "application/json"); return;
             }
 
-            // Rút gọn FEN để so sánh với Opening Book
             std::string fen_short = fen.substr(0, fen.find_last_of(" "));
             fen_short = fen_short.substr(0, fen_short.find_last_of(" ")); 
             
@@ -402,7 +411,6 @@ int main() {
                 res.set_content("{\"uci\":\"NONE\"}", "application/json"); return;
             }
 
-            // Kiểm tra Opening Book
             if (opening_book.find(fen_short) != opening_book.end()) {
                 std::string book_move_uci = opening_book[fen_short];
                 for (int i = 0; i < moves.size(); i++) {
