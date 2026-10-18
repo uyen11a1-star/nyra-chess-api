@@ -79,10 +79,10 @@ const int KING_MID_PST[64] = {
      20, 30, 10,  0,  0, 10, 30, 20
 };
 
-// --- OPENING BOOK (Sửa lỗi ghi đè FEN) ---
+// --- MỞ RỘNG OPENING BOOK ---
 std::unordered_map<std::string, std::string> opening_book = {
-    // 1. e4
-    {"rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq -", "e7e5"}, // Mở (Open Game)
+    // 1. e4 (Open Game)
+    {"rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq -", "e7e5"},
     // 1. e4 c5 (Sicilian)
     {"rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq -", "c7c5"},
     // 1. e4 e6 (French)
@@ -100,7 +100,9 @@ std::unordered_map<std::string, std::string> opening_book = {
     // 1. e4 e5 2. Nf3 Nc6 3. Bb5 (Ruy Lopez)
     {"r1bqkbnr/pppp1ppp/2n5/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R b KQkq -", "a7a6"},
     // 1. e4 e5 2. f4 (King's Gambit)
-    {"rnbqkbnr/pppp1ppp/8/4p3/4PP2/8/PPPP2PP/RNBQKBNR b KQkq -", "e5f4"}
+    {"rnbqkbnr/pppp1ppp/8/4p3/4PP2/8/PPPP2PP/RNBQKBNR b KQkq -", "e5f4"},
+    // 1. e4 e5 2. Nf3 Nc6 3. Bc4 Bc5 4. c3 (Giuoco Piano)
+    {"r1bqk1nr/pppp1ppp/2n5/2b1p3/2B1P3/2P2N2/PP1P1PPP/RNBQK2R b KQkq -", "g8f6"}
 };
 
 // --- ZOBRIST HASHING ---
@@ -168,7 +170,7 @@ uint64_t get_hash(const Board& board) {
 }
 
 // ============================================================
-// HÀM ĐÁNH GIÁ
+// HÀM ĐÁNH GIÁ (BỎ PHẠT XE Ở HÀNG CUỐI)
 // ============================================================
 int evaluate_white_score(Board& board) {
     int score = 0;
@@ -211,14 +213,10 @@ int evaluate_white_score(Board& board) {
             val -= static_cast<int>(PIECE_VALUES[pt_idx] * 0.9);
         }
 
-        if (p.type() == PieceType::QUEEN && is_attacked) val -= 100; 
-
+        // Chỉ phạt Xe ra rìa (a, h) trong khai cuộc, KHÔNG phạt Xe ở hàng cuối
         if (p.type() == PieceType::ROOK && board.fullMoveNumber() <= 15) {
             int file = sq % 8;
-            int rank = sq / 8;
-            int home_rank = (p.color() == Color::WHITE) ? 0 : 7;
             if (file == 0 || file == 7) val -= 40; 
-            if (rank == home_rank) val -= 20; 
         }
 
         if (board.fullMoveNumber() <= 10 && p.type() == PieceType::QUEEN) val -= 20;
@@ -406,6 +404,9 @@ int evaluate_board(Board& board) {
     return current_score;
 }
 
+// ============================================================
+// MOVE ORDERING (ĐẨY XE ĐI VÔ NGHĨA XUỐNG CUỐI)
+// ============================================================
 void order_moves(Board& board, Movelist& moves) {
     struct SM { Move m; int s; };
     std::vector<SM> sm;
@@ -423,6 +424,17 @@ void order_moves(Board& board, Movelist& moves) {
         
         if (move.promotionType() != PieceType::NONE) score += 9000;
         if (static_cast<int>(board.givesCheck(move)) != 0) score += 5000;
+
+        // NẾU LÀ NƯỚC XE RA RÌA TRONG KHAI CUỘC -> ĐẨY XUỐNG CUỐI
+        if (board.fullMoveNumber() <= 10 && !board.isCapture(move)) {
+            Piece p = board.at(move.from());
+            if (p != Piece::NONE && p.type() == PieceType::ROOK) {
+                int to_file = move.to().index() % 8;
+                if (to_file == 0 || to_file == 7) {
+                    score -= 9999; // Ưu tiên thấp nhất, chỉ đi khi bí
+                }
+            }
+        }
 
         sm.push_back({move, score});
     }
@@ -569,9 +581,6 @@ std::string extract_fen(const std::string& body) {
     return body.substr(start, end - start);
 }
 
-// ============================================================
-// HÀM LẤY FEN RÚT GỌN CHUẨN XÁC 100%
-// ============================================================
 std::string get_short_fen(const std::string& full_fen) {
     std::istringstream iss(full_fen);
     std::string board, turn, castling, ep;
@@ -622,7 +631,6 @@ int main() {
                 res.set_content("{\"uci\":\"NONE\"}", "application/json"); return;
             }
 
-            // 1. Kiểm tra Opening Book
             if (opening_book.find(fen_short) != opening_book.end()) {
                 std::string book_move_uci = opening_book[fen_short];
                 for (int i = 0; i < moves.size(); i++) {
@@ -633,7 +641,6 @@ int main() {
                 }
             }
 
-            // 2. Search
             transposition_table.clear();
             transposition_table.reserve(200000); 
             order_moves(board, moves);
