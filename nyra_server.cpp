@@ -88,15 +88,12 @@ enum TTFlag { EXACT, LOWERBOUND, UPPERBOUND };
 struct TTEntry { int depth; int score; TTFlag flag; Move best_move; };
 std::unordered_map<uint64_t, TTEntry> transposition_table;
 
-// --- KILLER MOVES ---
-Move killer_moves[100][2];
-
 std::chrono::steady_clock::time_point start_time;
 bool time_is_up = false;
 long long total_nodes = 0;
 
 const int TIME_LIMIT_MS = 15000; 
-const int MAX_DEPTH = 15; 
+const int MAX_DEPTH = 10; 
 const int MAX_Q_DEPTH = 6; 
 
 void init_zobrist() {
@@ -145,6 +142,9 @@ uint64_t get_hash(const Board& board) {
     return h;
 }
 
+// ============================================================
+// HÀM ĐÁNH GIÁ NÂNG CAO (GIAI ĐOẠN 2)
+// ============================================================
 int evaluate_white_score(Board& board) {
     int score = 0;
     int phase = 0;
@@ -160,6 +160,7 @@ int evaluate_white_score(Board& board) {
     }
     bool endgame = (phase <= 6);
 
+    // 1. Material, PST & Tấn công Vua
     for (int sq = 0; sq < 64; sq++) {
         Piece p = board.at(sq);
         if (p == Piece::NONE) continue;
@@ -179,15 +180,16 @@ int evaluate_white_score(Board& board) {
         Square s = static_cast<Square>(sq);
         Color enemy = (p.color() == Color::WHITE) ? Color::BLACK : Color::WHITE;
 
+        // Phạt quân bị treo
         bool is_attacked = board.isAttacked(s, enemy);
         bool is_defended = board.isAttacked(s, p.color());
-        
         if (is_attacked && !is_defended && p.type() != PieceType::KING) {
             val -= static_cast<int>(PIECE_VALUES[pt_idx] * 0.9);
         }
 
         if (board.fullMoveNumber() <= 10 && p.type() == PieceType::QUEEN) val -= 20;
 
+        // Thưởng điểm tấn công Vua
         Square enemy_king = board.kingSq(enemy);
         if (enemy_king != Square::underlying::NO_SQ) {
             int dist = std::abs((s.index() % 8) - (enemy_king.index() % 8)) + 
@@ -198,6 +200,7 @@ int evaluate_white_score(Board& board) {
         score += sign * val;
     }
 
+    // 2. Cặp Tượng
     int w_bishops = 0, b_bishops = 0;
     for(int sq=0; sq<64; sq++) {
         Piece p = board.at(sq);
@@ -208,6 +211,95 @@ int evaluate_white_score(Board& board) {
     if (w_bishops >= 2) score += 35;
     if (b_bishops >= 2) score -= 35;
 
+    // 3. Cấu trúc Tốt & Tốt thông (Passed Pawn)
+    for (int file = 0; file < 8; file++) {
+        int w_pawns = 0, b_pawns = 0;
+        for (int rank = 0; rank < 8; rank++) {
+            Piece p = board.at(chess::Square(chess::File(file), chess::Rank(rank)));
+            if (p != Piece::NONE && p.type() == PieceType::PAWN) {
+                if (p.color() == Color::WHITE) w_pawns++;
+                else b_pawns++;
+            }
+        }
+        if (w_pawns > 1) score -= 20 * (w_pawns - 1); // Tốt chồng
+        if (b_pawns > 1) score += 20 * (b_pawns - 1);
+    }
+
+    for (int sq = 0; sq < 64; sq++) {
+        Piece p = board.at(sq);
+        if (p == Piece::NONE || p.type() != PieceType::PAWN) continue;
+
+        int sign = (p.color() == Color::WHITE) ? 1 : -1;
+        int file = sq % 8;
+        int rank = sq / 8;
+        int rel_rank = (p.color() == Color::WHITE) ? rank : (7 - rank);
+        
+        // Kiểm tra Tốt thông (Passed Pawn)
+        bool is_passed = true;
+        for (int df = -1; df <= 1; df++) {
+            int nf = file + df;
+            if (nf < 0 || nf >= 8) continue;
+            for (int r = rank + (p.color() == Color::WHITE ? 1 : -1); r >= 0 && r < 8; r += (p.color() == Color::WHITE ? 1 : -1)) {
+                Piece enemy_p = board.at(chess::Square(chess::File(nf), chess::Rank(r)));
+                if (enemy_p != Piece::NONE && enemy_p.type() == PieceType::PAWN && enemy_p.color() != p.color()) {
+                    is_passed = false;
+                    break;
+                }
+            }
+            if (!is_passed) break;
+        }
+        
+        if (is_passed) {
+            // Thưởng điểm tăng dần theo cấp bậc của Tốt
+            if (rel_rank >= 2) score += sign * (rel_rank * 15);
+            if (rel_rank == 6) score += sign * 50; // Sát nút phong cấp
+        }
+    }
+
+    // 4. Xe trên cột mở / bán mở
+    for (int sq = 0; sq < 64; sq++) {
+        Piece p = board.at(sq);
+        if (p == Piece::NONE || p.type() != PieceType::ROOK) continue;
+
+        int sign = (p.color() == Color::WHITE) ? 1 : -1;
+        int file = sq % 8;
+        int rank = sq / 8;
+        
+        bool own_pawn_on_file = false;
+        bool enemy_pawn_on_file = false;
+        for (int r = 0; r < 8; r++) {
+            Piece pawn = board.at(chess::Square(chess::File(file), chess::Rank(r)));
+            if (pawn != Piece::NONE && pawn.type() == PieceType::PAWN) {
+                if (pawn.color() == p.color()) own_pawn_on_file = true;
+                else enemy_pawn_on_file = true;
+            }
+        }
+        
+        if (!own_pawn_on_file && !enemy_pawn_on_file) score += sign * 25; // Cột mở
+        else if (!own_pawn_on_file && enemy_pawn_on_file) score += sign * 15; // Cột bán mở
+        
+        int rel_rank = (p.color() == Color::WHITE) ? rank : (7 - rank);
+        if (rel_rank == 6) score += sign * 30; // Xe ở hàng 7
+    }
+
+    // 5. Mã tiền đồn (Knight Outpost)
+    for (int sq = 0; sq < 64; sq++) {
+        Piece p = board.at(sq);
+        if (p == Piece::NONE || p.type() != PieceType::KNIGHT) continue;
+
+        int sign = (p.color() == Color::WHITE) ? 1 : -1;
+        int rank = sq / 8;
+        int rel_rank = (p.color() == Color::WHITE) ? rank : (7 - rank);
+
+        if (rel_rank >= 2 && rel_rank <= 5) {
+            Square s = static_cast<Square>(sq);
+            if (board.isAttacked(s, p.color())) {
+                score += sign * 20;
+            }
+        }
+    }
+
+    // 6. An toàn Vua (Nâng cao)
     for (Color color : {Color::WHITE, Color::BLACK}) {
         int sign = (color == Color::WHITE) ? 1 : -1;
         Square k_sq = board.kingSq(color);
@@ -257,7 +349,7 @@ int evaluate_board(Board& board) {
     return current_score;
 }
 
-void order_moves(Board& board, Movelist& moves, int ply) {
+void order_moves(Board& board, Movelist& moves) {
     struct SM { Move m; int s; };
     std::vector<SM> sm;
     sm.reserve(moves.size());
@@ -275,11 +367,6 @@ void order_moves(Board& board, Movelist& moves, int ply) {
         if (move.promotionType() != PieceType::NONE) score += 9000;
         
         if (static_cast<int>(board.givesCheck(move)) != 0) score += 5000;
-        
-        if (ply < 100) {
-            if (move == killer_moves[ply][0]) score += 4000;
-            else if (move == killer_moves[ply][1]) score += 3000;
-        }
 
         sm.push_back({move, score});
     }
@@ -319,7 +406,7 @@ int quiescence(Board& board, int alpha, int beta, int depth) {
         }
     }
     
-    order_moves(board, search_moves, 99);
+    order_moves(board, search_moves);
 
     for (int i = 0; i < search_moves.size(); i++) {
         board.makeMove(search_moves[i]);
@@ -331,7 +418,7 @@ int quiescence(Board& board, int alpha, int beta, int depth) {
     return alpha;
 }
 
-int negamax(Board& board, int depth, int alpha, int beta, int ply) {
+int negamax(Board& board, int depth, int alpha, int beta) {
     if (time_is_up) return evaluate_board(board);
 
     total_nodes++;
@@ -359,12 +446,10 @@ int negamax(Board& board, int depth, int alpha, int beta, int ply) {
         }
     }
 
-    // NMP ĐÃ BỊ GỠ BỎ HOÀN TOÀN Ở ĐÂY ĐỂ TRÁNH CRASH
-
     Movelist moves; movegen::legalmoves(moves, board);
     if (moves.size() == 0) return in_check ? -MATE_SCORE + depth : 0;
     
-    order_moves(board, moves, ply);
+    order_moves(board, moves);
     
     int best = -INF;
     Move best_move_in_node = moves[0];
@@ -379,20 +464,19 @@ int negamax(Board& board, int depth, int alpha, int beta, int ply) {
         int extension = board.inCheck() ? 1 : 0;
         int new_depth = depth - 1 + extension;
 
-        // LMR
         if (i >= 3 && depth >= 3 && !in_check && !is_capture && !gives_check) {
             new_depth -= 1; 
         }
 
         int score;
         if (i == 0) {
-            score = -negamax(board, new_depth, -beta, -alpha, ply + 1);
+            score = -negamax(board, new_depth, -beta, -alpha);
         } else {
-            score = -negamax(board, new_depth, -alpha - 1, -alpha, ply + 1);
+            score = -negamax(board, new_depth, -alpha - 1, -alpha);
             if (score > alpha && new_depth < depth - 1 + extension) {
-                score = -negamax(board, depth - 1 + extension, -beta, -alpha, ply + 1);
+                score = -negamax(board, depth - 1 + extension, -beta, -alpha);
             } else if (score > alpha && score < beta) {
-                score = -negamax(board, depth - 1 + extension, -beta, -alpha, ply + 1);
+                score = -negamax(board, depth - 1 + extension, -beta, -alpha);
             }
         }
         board.unmakeMove(moves[i]);
@@ -407,12 +491,6 @@ int negamax(Board& board, int depth, int alpha, int beta, int ply) {
         }
         if (alpha >= beta) {
             flag = LOWERBOUND;
-            if (!is_capture && ply < 100) {
-                if (killer_moves[ply][0] != moves[i]) {
-                    killer_moves[ply][1] = killer_moves[ply][0];
-                    killer_moves[ply][0] = moves[i];
-                }
-            }
             break;
         }
     }
@@ -437,7 +515,7 @@ std::string extract_fen(const std::string& body) {
 
 int main() {
     init_zobrist();
-    std::cout << "Khởi động Nyra Engine (Giai đoạn 1: LMR + Killer Moves)..." << std::endl;
+    std::cout << "Khởi động Nyra Engine (Giai đoạn 2: Eval Nâng Cao)..." << std::endl;
 
     httplib::Server svr;
 
@@ -476,13 +554,7 @@ int main() {
 
             transposition_table.clear();
             transposition_table.reserve(200000); 
-            
-            for (int i = 0; i < 100; i++) {
-                killer_moves[i][0] = Move();
-                killer_moves[i][1] = Move();
-            }
-            
-            order_moves(board, moves, 0);
+            order_moves(board, moves);
             
             int best_score = -INF;
             Move best_move = moves[0];
@@ -503,7 +575,7 @@ int main() {
 
                 for (int i = 0; i < moves.size(); i++) {
                     board.makeMove(moves[i]);
-                    int score = -negamax(board, depth - 1, -beta, -alpha, 1);
+                    int score = -negamax(board, depth - 1, -beta, -alpha);
                     board.unmakeMove(moves[i]);
 
                     if (time_is_up) break;
