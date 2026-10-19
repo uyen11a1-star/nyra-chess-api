@@ -18,7 +18,7 @@ typedef uint64_t U64;
 
 // ================= CẤU HÌNH =================
 int TIME_LIMIT_MS = 2000;  // tối đa mỗi nước (mili-giây, giới hạn cứng)
-int SOFT_LIMIT_MS = 900;   // quá mốc này thì không bắt đầu độ sâu mới
+int SOFT_LIMIT_MS = 1300;  // quá mốc này thì không bắt đầu độ sâu mới
 const int MAX_DEPTH = 64;
 const int MAX_PLY = 96;
 const int MATE_SCORE = 100000;
@@ -563,7 +563,7 @@ SearchResult search_position(Board& board) {
             } else break;
             if (delta > 400) { alpha = -INF; beta = INF; }
         }
-        if (stop_search) break;
+        if (stop_search) { if (root_best != Move::NO_MOVE) best = root_best; break; }
         if (root_best != Move::NO_MOVE) { best = root_best; root_pv_move = best; }
         best_score = score;
         done_depth = depth;
@@ -632,7 +632,7 @@ int main() {
     tt.assign((size_t)1 << TT_BITS, TTEntry());
     if (const char* t = std::getenv("NYRA_TIME_MS")) {  // tuỳ chọn: chỉnh thời gian nghĩ khi test
         TIME_LIMIT_MS = std::max(50, std::stoi(t));
-        SOFT_LIMIT_MS = TIME_LIMIT_MS / 2;
+        SOFT_LIMIT_MS = TIME_LIMIT_MS * 13 / 20;
     }
     std::cout << "Khởi động Nyra Engine (PVS + tapered eval + book)..." << std::endl;
 
