@@ -12,6 +12,8 @@
 #include <unordered_map>
 #include <random>
 #include <mutex>
+#include <thread>
+#include <atomic>
 
 using namespace chess;
 typedef uint64_t U64;
@@ -279,7 +281,8 @@ inline int from_tt(int s, int ply) { return s >= MATE_BOUND ? s - ply : (s <= -M
 
 // ================= TRẠNG THÁI TÌM KIẾM =================
 std::chrono::steady_clock::time_point start_time;
-bool stop_search = false;
+std::atomic<bool> stop_search(false);
+long long search_limit_ms = 2000;
 long long total_nodes = 0;
 Move killers[MAX_PLY + 2][2];
 int history_tbl[2][64][64];
@@ -316,7 +319,7 @@ void update_history(int stm, const Move& m, int bonus) {
 int quiescence(Board& board, int alpha, int beta, int ply) {
     if (stop_search) return 0;
     total_nodes++;
-    if ((total_nodes & 2047) == 0 && elapsed_ms() >= TIME_LIMIT_MS) { stop_search = true; return 0; }
+    if ((total_nodes & 2047) == 0 && elapsed_ms() >= search_limit_ms) { stop_search = true; return 0; }
     if (ply >= MAX_PLY - 1) return evaluate(board);
 
     bool in_check = board.inCheck();
@@ -376,7 +379,7 @@ int quiescence(Board& board, int alpha, int beta, int ply) {
 int negamax(Board& board, int depth, int alpha, int beta, int ply, bool allow_null) {
     if (stop_search) return 0;
     total_nodes++;
-    if ((total_nodes & 2047) == 0 && elapsed_ms() >= TIME_LIMIT_MS) { stop_search = true; return 0; }
+    if ((total_nodes & 2047) == 0 && elapsed_ms() >= search_limit_ms) { stop_search = true; return 0; }
 
     const bool pv = (beta - alpha) > 1;
     if (ply > 0) {
@@ -534,6 +537,7 @@ struct SearchResult { Move move; int score; int depth; };
 
 SearchResult search_position(Board& board) {
     stop_search = false;
+    search_limit_ms = TIME_LIMIT_MS;
     total_nodes = 0;
     start_time = std::chrono::steady_clock::now();
     std::memset(history_tbl, 0, sizeof(history_tbl));
@@ -571,6 +575,37 @@ SearchResult search_position(Board& board) {
         if (std::abs(score) >= MATE_BOUND && depth > MATE_SCORE - std::abs(score)) break;
     }
     return {best, best_score, done_depth};
+}
+
+// ================= PONDERING (tìm trước trong lúc người chơi nghĩ) =================
+int PONDER_LIMIT_MS = 20000;  // thời gian tối đa tìm trước (mili-giây), 0 = tắt
+std::thread ponder_thread;
+
+void stop_ponder() {  // dừng luồng tìm trước (nếu có) và chờ nó kết thúc hẳn
+    if (ponder_thread.joinable()) {
+        stop_search = true;
+        ponder_thread.join();
+    }
+}
+
+void ponder_search(Board board) {
+    stop_search = false;
+    search_limit_ms = PONDER_LIMIT_MS;
+    total_nodes = 0;
+    start_time = std::chrono::steady_clock::now();
+    std::memset(history_tbl, 0, sizeof(history_tbl));
+    for (int i = 0; i < MAX_PLY + 2; i++) killers[i][0] = killers[i][1] = Move::NO_MOVE;
+    for (int depth = 1; depth <= MAX_DEPTH; depth++) {
+        int score = negamax(board, depth, -INF, INF, 0, false);
+        if (stop_search) break;
+        if (std::abs(score) >= MATE_BOUND) break;
+    }
+}
+
+void start_ponder(const Board& b) {
+    if (PONDER_LIMIT_MS <= 0) return;
+    stop_ponder();
+    ponder_thread = std::thread(ponder_search, b);
 }
 
 // ================= OPENING BOOK (xây từ các dòng khai cuộc, có biến thể ngẫu nhiên) =================
@@ -634,6 +669,7 @@ int main() {
         TIME_LIMIT_MS = std::max(50, std::stoi(t));
         SOFT_LIMIT_MS = TIME_LIMIT_MS * 13 / 20;
     }
+    if (const char* pm = std::getenv("NYRA_PONDER_MS")) PONDER_LIMIT_MS = std::max(0, std::stoi(pm));
     std::cout << "Khởi động Nyra Engine (PVS + tapered eval + book)..." << std::endl;
 
     httplib::Server svr;
@@ -657,6 +693,7 @@ int main() {
         res.set_header("Access-Control-Allow-Origin", "*");
         try {
             std::lock_guard<std::mutex> lock(engine_mutex);
+            stop_ponder();
             std::string fen = extract_fen(req.body);
             if (fen.empty()) {
                 res.status = 400; res.set_content("{\"error\":\"No FEN\"}", "application/json"); return;
@@ -689,6 +726,9 @@ int main() {
                 std::to_string(r.depth) + ", \"time_ms\":" + std::to_string(ms) +
                 ", \"nodes\":" + std::to_string(total_nodes) + ", \"score\":" + std::to_string(r.score) + "}}";
             res.set_content(json_resp, "application/json");
+            Board after = board;
+            after.makeMove(r.move);
+            start_ponder(after);  // tìm trước trong lúc người chơi nghĩ
         } catch (const std::exception& ex) {
             std::cerr << "Lỗi C++: " << ex.what() << std::endl;
             res.status = 500; res.set_content("{\"error\":\"Internal Engine Error\"}", "application/json");
